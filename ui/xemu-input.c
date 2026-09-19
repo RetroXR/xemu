@@ -262,6 +262,15 @@ static const int port_map[4] = { 3, 4, 1, 2 };
 
 void xemu_input_init(void)
 {
+#ifdef CONFIG_LIBRETRO
+    // Input devices are provided by the libretro frontend
+    for (int i = 0; i < 4; i++) {
+        bound_drivers[i] = get_bound_driver(i);
+    }
+    xemu_libretro_input_init();
+    return;
+#endif
+
     if (g_config.input.background_input_capture) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
@@ -516,6 +525,10 @@ void xemu_input_update_controller(ControllerState *state)
         xemu_input_update_sdl_kbd_controller_state(state);
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
+#ifdef CONFIG_LIBRETRO
+    } else if (state->type == INPUT_DEVICE_LIBRETRO) {
+        xemu_libretro_input_update_controller_state(state);
+#endif
     }
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -653,6 +666,13 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 
 void xemu_input_update_rumble(ControllerState *state)
 {
+#ifdef CONFIG_LIBRETRO
+    if (state->type == INPUT_DEVICE_LIBRETRO) {
+        xemu_libretro_input_update_rumble(state);
+        return;
+    }
+#endif
+
     if (state->type != INPUT_DEVICE_SDL_GAMEPAD) {
         return;
     }

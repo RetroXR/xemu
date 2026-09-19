@@ -113,6 +113,8 @@ option('cfi_debug', type: 'boolean', value: false,
        description: 'Verbose errors in case of CFI violation')
 option('multiprocess', type: 'feature', value: 'auto',
        description: 'Out of process device emulation support')
+option('libretro', type: 'boolean', value: false,
+       description: 'Build xemu as a libretro core instead of a standalone executable')
 option('renderdoc', type: 'feature', value: 'auto',
        description: 'RenderDoc frame capture support')
 option('relocatable', type : 'boolean', value : true,

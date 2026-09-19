@@ -27,20 +27,27 @@ xemu_ss.add(files(
   'xemu-settings.cc',
   'xemu-controllers.cc',
 
-  'xemu.c',
   'xemu-data.c',
   'xemu-snapshots.c',
-  'xemu-thumbnail.cc',
   'xemu-widescreen.c',
 ))
 
-if host_os == 'windows'
-  d3d11 = cc.find_library('d3d11', required: true)
-  dxgi = cc.find_library('dxgi', required: true)
-  xemu_ss.add(nvapi, d3d11, dxgi)
-endif
+if have_libretro
+  subdir('libretro')
+else
+  xemu_ss.add(files(
+    'xemu.c',
+    'xemu-thumbnail.cc',
+  ))
 
-subdir('xui')
+  if host_os == 'windows'
+    d3d11 = cc.find_library('d3d11', required: true)
+    dxgi = cc.find_library('dxgi', required: true)
+    xemu_ss.add(nvapi, d3d11, dxgi)
+  endif
+
+  subdir('xui')
+endif
 
 if host_os == 'darwin'
   xemu_cocoa = dependency('appleframeworks', modules: 'Cocoa')

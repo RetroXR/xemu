@@ -90,6 +90,18 @@ package_linux() {
     fi
 }
 
+package_libretro() {
+    rm -rf dist
+    mkdir -p dist
+    cp "build/${target}" dist/
+    case "$platform" in
+        CYGWIN*|MINGW*|MSYS*|win64-cross)
+            python3 ./scripts/gen-license.py --platform windows > dist/LICENSE.txt ;;
+        *)
+            python3 ./scripts/gen-license.py > dist/LICENSE.txt ;;
+    esac
+}
+
 postbuild=''
 debug_opts=''
 build_cflags=''
@@ -131,6 +143,7 @@ get_job_count () {
 job_count="$(get_job_count)" 2>/dev/null
 job_count="${job_count:-${default_job_count}}"
 debug=""
+libretro=""
 opts=""
 platform="$(uname -s)"
 
@@ -143,6 +156,10 @@ do
         ;;
     '--debug')
         debug="y"
+        shift
+        ;;
+    '--libretro')
+        libretro="y"
         shift
         ;;
     '-p'*)
@@ -253,6 +270,17 @@ case "$platform" in # Adjust compilation options based on platform
         exit -1
         ;;
 esac
+
+if test ! -z "$libretro"; then
+    # Build the libretro core instead of the standalone executable
+    opts="$opts --enable-libretro"
+    case "$platform" in
+        CYGWIN*|MINGW*|MSYS*|win64-cross) target="xemu_libretro.dll" ;;
+        Darwin) target="xemu_libretro.dylib" ;;
+        *) target="xemu_libretro.so" ;;
+    esac
+    postbuild='package_libretro'
+fi
 
 # find absolute path (and resolve symlinks) to build out of tree
 configure="${project_source_dir}/configure"

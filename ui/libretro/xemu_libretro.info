@@ -1,0 +1,49 @@
+# Software Information
+display_name = "Microsoft - Xbox (xemu)"
+authors = "xemu-project team|Matt Borgerson"
+supported_extensions = "iso|xiso"
+corename = "xemu"
+categories = "Emulator"
+license = "GPLv2"
+permissions = ""
+display_version = "Git"
+
+# Hardware Information
+manufacturer = "Microsoft"
+systemname = "Xbox"
+systemid = "xbox"
+
+# Libretro Features
+database = "Microsoft - Xbox"
+supports_no_game = "true"
+savestate = "false"
+savestate_features = "null"
+cheats = "false"
+input_descriptors = "true"
+memory_descriptors = "false"
+libretro_saves = "false"
+core_options = "true"
+core_options_version = "2.0"
+load_subsystem = "false"
+hw_render = "false"
+needs_fullpath = "true"
+disk_control = "false"
+is_experimental = "true"
+
+# Firmware / BIOS
+firmware_count = 4
+firmware0_desc = "mcpx_1.0.bin (MCPX Boot ROM)"
+firmware0_path = "xemu/mcpx_1.0.bin"
+firmware0_opt = "false"
+firmware1_desc = "Complex_4627v1.03.bin (Flash ROM / BIOS)"
+firmware1_path = "xemu/Complex_4627v1.03.bin"
+firmware1_opt = "false"
+firmware2_desc = "xbox_hdd.qcow2 (Hard disk image)"
+firmware2_path = "xemu/xbox_hdd.qcow2"
+firmware2_opt = "false"
+firmware3_desc = "xbox_eeprom.bin (EEPROM, generated on first start)"
+firmware3_path = "xemu/xbox_eeprom.bin"
+firmware3_opt = "true"
+
+description = "xemu, the original Xbox emulator built on QEMU, as a libretro core. The whole machine is emulated: Pentium III CPU through TCG, the NV2A GPU on OpenGL or Vulkan, and MCPX audio. The machine runs on its own threads in real time, as it does in standalone xemu, and the core hands the most recent frame to the frontend as a software framebuffer, so it works with any frontend video driver. Requires an MCPX boot ROM, a flash BIOS and a hard disk image in the 'xemu' folder of the system directory. Game saves are kept inside the hard disk image."
+notes = "(!) Requires mcpx_1.0.bin, a flash BIOS (Complex_4627v1.03.bin recommended) and xbox_hdd.qcow2 in the 'xemu' folder of the system directory. Other names are found as well, and an xemu.toml placed there can point elsewhere.|(!) An OpenGL 4.0 capable GPU driver is required, with either renderer, even though the core outputs a software framebuffer.|(!) Content must be an XISO image; the disc is opened from its full path.|Game saves live inside xbox_hdd.qcow2. Memory units enabled through the core options are kept in the save directory.|The machine is created once per process: closing content parks it, and loading the next game swaps the disc and resets. Options marked as needing a restart apply when the frontend is restarted.|Save states, rewind, fast-forward and run-ahead are not supported.|Experimental core."

@@ -143,6 +143,7 @@ meson_options_help() {
   printf "%s\n" '  libdw           debuginfo support'
   printf "%s\n" '  libiscsi        libiscsi userspace initiator'
   printf "%s\n" '  libkeyutils     Linux keyutils support'
+  printf "%s\n" '  libretro        Build xemu as a libretro core'
   printf "%s\n" '  libnfs          libnfs block device driver'
   printf "%s\n" '  libpmem         libpmem support'
   printf "%s\n" '  libssh          ssh block device support'
@@ -379,6 +380,8 @@ _meson_option_parse() {
     --enable-libiscsi) printf "%s" -Dlibiscsi=enabled ;;
     --disable-libiscsi) printf "%s" -Dlibiscsi=disabled ;;
     --enable-libkeyutils) printf "%s" -Dlibkeyutils=enabled ;;
+    --enable-libretro) printf "%s" -Dlibretro=true ;;
+    --disable-libretro) printf "%s" -Dlibretro=false ;;
     --disable-libkeyutils) printf "%s" -Dlibkeyutils=disabled ;;
     --enable-libnfs) printf "%s" -Dlibnfs=enabled ;;
     --disable-libnfs) printf "%s" -Dlibnfs=disabled ;;

@@ -2518,6 +2518,8 @@ config_host_data.set('CONFIG_AUDIO_DRIVERS',
 have_host_block_device = (host_os != 'darwin' or
     cc.has_header('IOKit/storage/IOMedia.h'))
 
+have_libretro = have_system and get_option('libretro')
+
 have_renderdoc = false
 if have_system and get_option('renderdoc').enabled()
   have_renderdoc = true
@@ -2790,6 +2792,7 @@ config_host_data.set('QEMU_VERSION_MICRO', meson.project_version().split('.')[2]
 config_host_data.set_quoted('CONFIG_HOST_DSOSUF', host_dsosuf)
 config_host_data.set('HAVE_HOST_BLOCK_DEVICE', have_host_block_device)
 config_host_data.set('CONFIG_RENDERDOC', have_renderdoc)
+config_host_data.set('CONFIG_LIBRETRO', have_libretro)
 
 have_coroutine_pool = get_option('coroutine_pool')
 if get_option('debug_stack_usage') and have_coroutine_pool
@@ -4621,7 +4624,15 @@ foreach target : target_dirs
       'sources': files('system/main.c'),
       'dependencies': [sdl]
     }]
-    if host_os == 'windows' and (sdl.found() or gtk.found())
+    if have_libretro
+      # Keep the usual name as the key, the tests look the emulator up by it
+      execs = [{
+        'name': 'qemu-system-' + target_name,
+        'libretro': true,
+        'sources': files('system/main.c'),
+        'dependencies': [sdl]
+      }]
+    elif host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
         'win_subsystem': 'windows',
@@ -4652,14 +4663,25 @@ foreach target : target_dirs
       exe_name += '-unsigned'
     endif
 
-    emulator = executable(exe_name, exe['sources'],
-               install: true,
-               c_args: c_args,
-               dependencies: arch_deps + exe['dependencies'],
-               objects: lib.extract_all_objects(recursive: true),
-               link_depends: [block_syms, qemu_syms],
-               link_args: link_args,
-               win_subsystem: exe['win_subsystem'])
+    if exe.get('libretro', false)
+      emulator = shared_module('xemu_libretro', exe['sources'],
+                 name_prefix: '',
+                 install: false,
+                 c_args: c_args,
+                 dependencies: arch_deps + exe['dependencies'],
+                 objects: lib.extract_all_objects(recursive: true),
+                 link_depends: [block_syms, qemu_syms],
+                 link_args: link_args)
+    else
+      emulator = executable(exe_name, exe['sources'],
+                 install: true,
+                 c_args: c_args,
+                 dependencies: arch_deps + exe['dependencies'],
+                 objects: lib.extract_all_objects(recursive: true),
+                 link_depends: [block_syms, qemu_syms],
+                 link_args: link_args,
+                 win_subsystem: exe['win_subsystem'])
+    endif
 
     if host_os == 'darwin'
       icon = 'pc-bios/qemu.rsrc'
