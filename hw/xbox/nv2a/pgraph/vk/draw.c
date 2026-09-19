@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
+#include "ui/xemu-settings.h"
 #include "renderer.h"
 #include <math.h>
 
@@ -121,19 +122,134 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
     return memcmp(&snode->key, key, sizeof(PipelineKey));
 }
 
+/*
+ * The driver's pipeline cache is kept on disk, so that the pipelines of a
+ * game are compiled by the driver once and not on every run.
+ */
+static char *get_pipeline_cache_path(void)
+{
+    return g_strdup_printf("%s/vk_pipeline_cache.bin",
+                           xemu_settings_get_base_path());
+}
+
+static bool load_pipeline_cache_data(PGRAPHVkState *r, gchar **data,
+                                     gsize *len)
+{
+    if (!g_config.perf.cache_shaders) {
+        return false;
+    }
+
+    g_autofree char *path = get_pipeline_cache_path();
+    if (!g_file_get_contents(path, data, len, NULL)) {
+        return false;
+    }
+
+    /* Drivers are not all careful with data that is not theirs */
+    VkPipelineCacheHeaderVersionOne header;
+    if (*len >= sizeof(header)) {
+        memcpy(&header, *data, sizeof(header));
+        if (header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+            header.vendorID == r->device_props.vendorID &&
+            header.deviceID == r->device_props.deviceID &&
+            !memcmp(header.pipelineCacheUUID,
+                    r->device_props.pipelineCacheUUID, VK_UUID_SIZE)) {
+            return true;
+        }
+    }
+
+    g_free(*data);
+    return false;
+}
+
+typedef struct PipelineCacheData {
+    char *path;
+    gchar *data;
+    size_t len;
+} PipelineCacheData;
+
+static gpointer write_pipeline_cache_thread(gpointer opaque)
+{
+    PipelineCacheData *d = opaque;
+
+    /* Replaces the file atomically */
+    g_file_set_contents(d->path, d->data, d->len, NULL);
+    g_free(d->path);
+    g_free(d->data);
+    g_free(d);
+    return NULL;
+}
+
+static void save_pipeline_cache(PGRAPHVkState *r, bool wait)
+{
+    if (!r->pipeline_cache_dirty || !g_config.perf.cache_shaders) {
+        return;
+    }
+    r->pipeline_cache_dirty = false;
+    r->pipeline_cache_save_time = g_get_monotonic_time();
+
+    PipelineCacheData *d = g_new0(PipelineCacheData, 1);
+    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &d->len,
+                               NULL) != VK_SUCCESS || !d->len) {
+        g_free(d);
+        return;
+    }
+    d->data = g_malloc(d->len);
+    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &d->len,
+                               d->data) != VK_SUCCESS) {
+        g_free(d->data);
+        g_free(d);
+        return;
+    }
+    d->path = get_pipeline_cache_path();
+
+    /* The file can be large, write it without holding up the renderer */
+    GThread *thread = g_thread_new("vk_pipeline_cache",
+                                   write_pipeline_cache_thread, d);
+    if (wait) {
+        g_thread_join(thread);
+    } else {
+        g_thread_unref(thread);
+    }
+}
+
+/*
+ * Nothing guarantees an orderly exit, a libretro frontend on a headset gets
+ * killed. Save after pipelines were added, but not more often than this.
+ */
+#define PIPELINE_CACHE_SAVE_INTERVAL_US (30 * G_USEC_PER_SEC)
+
+static void save_pipeline_cache_periodically(PGRAPHVkState *r)
+{
+    if (r->pipeline_cache_dirty &&
+        g_get_monotonic_time() - r->pipeline_cache_save_time >
+            PIPELINE_CACHE_SAVE_INTERVAL_US) {
+        save_pipeline_cache(r, false);
+    }
+}
+
 static void init_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    gchar *initial_data = NULL;
+    gsize initial_data_len = 0;
+    if (!load_pipeline_cache_data(r, &initial_data, &initial_data_len)) {
+        initial_data = NULL;
+        initial_data_len = 0;
+    }
+
     VkPipelineCacheCreateInfo cache_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
         .flags = 0,
-        .initialDataSize = 0,
-        .pInitialData = NULL,
+        .initialDataSize = initial_data_len,
+        .pInitialData = initial_data,
         .pNext = NULL,
     };
     VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
                                    &r->vk_pipeline_cache));
+    g_free(initial_data);
+    r->pipeline_cache_dirty = false;
+    r->pipeline_cache_save_time = g_get_monotonic_time();
 
     const size_t pipeline_cache_size = 2048;
     lru_init(&r->pipeline_cache);
@@ -157,6 +273,7 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
     g_free(r->pipeline_cache_entries);
     r->pipeline_cache_entries = NULL;
 
+    save_pipeline_cache(r, true);
     vkDestroyPipelineCache(r->device, r->vk_pipeline_cache, NULL);
 }
 
@@ -448,6 +565,7 @@ static void create_clear_pipeline(PGRAPHState *pg)
 
     NV2A_VK_DPRINTF("Cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_PIPELINE_GEN);
+    r->pipeline_cache_dirty = true;
     memcpy(&snode->key, &key, sizeof(key));
 
     bool clear_any_color_channels =
@@ -728,6 +846,7 @@ static void create_pipeline(PGRAPHState *pg)
 
     NV2A_VK_DPRINTF("Cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_PIPELINE_GEN);
+    r->pipeline_cache_dirty = true;
 
     memcpy(&snode->key, &key, sizeof(key));
 
@@ -1305,6 +1424,9 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 
         if (check_budget) {
             pgraph_vk_check_memory_budget(pg);
+        }
+        if (finish_reason == VK_FINISH_REASON_FLIP_STALL) {
+            save_pipeline_cache_periodically(r);
         }
     }
 
