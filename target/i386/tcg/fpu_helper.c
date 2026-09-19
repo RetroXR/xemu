@@ -73,8 +73,9 @@
 #define floatx80_ln2_d make_floatx80(0x3ffe, 0xb17217f7d1cf79abLL)
 #define floatx80_pi_d make_floatx80(0x4000, 0xc90fdaa22168c234LL)
 
-#if defined(XBOX) && defined(__x86_64__)
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
 #ifdef USE_HARD_FPU
+#if defined(__x86_64__)
 /*
  * FIXME: rounding and exceptions
  */
@@ -164,6 +165,262 @@ floatx80 int32_to_floatx80__hard(int32_t a, float_status *status)
 {
     return (floatx80){ .fval = a };
 }
+
+#else /* __aarch64__ */
+/*
+ * There is no 80 bit format in hardware here, so this computes in double
+ * precision, and only where that gives the result softfloat would: the
+ * precision control selects single or double precision (what games run
+ * with), rounding is to nearest, the operands are exact as doubles and the
+ * result is a normal number or zero. Everything else is left to softfloat.
+ * With single precision selected the result is rounded twice, which is only
+ * known to be harmless for operands that are single precision themselves.
+ *
+ * FIXME: exceptions
+ */
+
+#define HARD_F64_EXP_BIAS 1023
+#define HARD_F32_EXP_BIAS 127
+
+static inline bool hard_fpu_usable(float_status *status)
+{
+    return status->float_rounding_mode == float_round_nearest_even &&
+           status->floatx80_rounding_precision != floatx80_precision_x;
+}
+
+static inline double hard_f64_from_bits(uint64_t bits)
+{
+    union {
+        uint64_t i;
+        double d;
+    } u = { .i = bits };
+    return u.d;
+}
+
+static inline uint64_t hard_f64_to_bits(double d)
+{
+    union {
+        double d;
+        uint64_t i;
+    } u = { .d = d };
+    return u.i;
+}
+
+/* Zeroes and normal numbers that a double holds exactly */
+static inline bool hard_floatx80_to_f64(floatx80 a, double *d)
+{
+    uint64_t sign = (uint64_t)(a.high >> 15) << 63;
+    int exp = a.high & 0x7fff;
+
+    if (exp == 0 && a.low == 0) {
+        *d = hard_f64_from_bits(sign);
+        return true;
+    }
+
+    exp += HARD_F64_EXP_BIAS - EXPBIAS;
+    if (!(a.low >> 63) || (a.low & 0x7ff) || exp <= 0 || exp >= 0x7ff) {
+        return false;
+    }
+
+    *d = hard_f64_from_bits(sign | ((uint64_t)exp << 52) |
+                            ((a.low << 1) >> 12));
+    return true;
+}
+
+static inline bool hard_f64_to_floatx80(double d, floatx80 *a)
+{
+    uint64_t bits = hard_f64_to_bits(d);
+    uint16_t sign = (bits >> 63) << 15;
+    int exp = (bits >> 52) & 0x7ff;
+
+    if ((bits << 1) == 0) {
+        *a = (floatx80){ .low = 0, .high = sign };
+        return true;
+    }
+
+    if (exp == 0 || exp == 0x7ff) {
+        return false;
+    }
+
+    a->low = (1ULL << 63) | ((bits << 12) >> 1);
+    a->high = sign | (exp + EXPBIAS - HARD_F64_EXP_BIAS);
+    return true;
+}
+
+/* Round the significand to 24 bits and leave the exponent range alone */
+static inline double hard_f64_round_to_single(double d)
+{
+    uint64_t bits = hard_f64_to_bits(d);
+    uint64_t rem = bits & 0x1fffffff;
+    int exp = (bits >> 52) & 0x7ff;
+
+    if (exp == 0 || exp == 0x7ff) {
+        return d;
+    }
+
+    bits -= rem;
+    if (rem > 0x10000000 || (rem == 0x10000000 && (bits & 0x20000000))) {
+        bits += 0x20000000;
+    }
+    return hard_f64_from_bits(bits);
+}
+
+#define HARD_FPU_ARITH(name, op, zero_is_exact)                              \
+static inline floatx80 floatx80_##name##__hard(floatx80 a, floatx80 b,      \
+                                                float_status *status)        \
+{                                                                            \
+    double x, y;                                                             \
+    floatx80 ret;                                                            \
+                                                                             \
+    if (hard_fpu_usable(status) && hard_floatx80_to_f64(a, &x) &&            \
+        hard_floatx80_to_f64(b, &y)) {                                       \
+        double r = x op y;                                                   \
+        if (status->floatx80_rounding_precision == floatx80_precision_s) {   \
+            r = hard_f64_round_to_single(r);                                 \
+        }                                                                    \
+        if ((r != 0.0 || (zero_is_exact)) &&                                 \
+            hard_f64_to_floatx80(r, &ret)) {                                 \
+            return ret;                                                      \
+        }                                                                    \
+    }                                                                        \
+    return floatx80_##name(a, b, status);                                    \
+}
+
+/* A sum is never rounded to zero, a product or a quotient may be */
+HARD_FPU_ARITH(add, +, true)
+HARD_FPU_ARITH(sub, -, true)
+HARD_FPU_ARITH(mul, *, x == 0.0 || y == 0.0)
+HARD_FPU_ARITH(div, /, x == 0.0 && y != 0.0)
+
+static inline bool hard_floatx80_is_ordinary(floatx80 a)
+{
+    int exp = a.high & 0x7fff;
+    return exp == 0 ? a.low == 0 : (exp != 0x7fff && (a.low >> 63));
+}
+
+static inline
+FloatRelation floatx80_compare__hard(floatx80 a, floatx80 b, float_status *status)
+{
+    if (!hard_floatx80_is_ordinary(a) || !hard_floatx80_is_ordinary(b)) {
+        return floatx80_compare(a, b, status);
+    }
+
+    bool a_neg = a.high >> 15;
+    bool b_neg = b.high >> 15;
+    int a_exp = a.high & 0x7fff;
+    int b_exp = b.high & 0x7fff;
+
+    if (a_neg != b_neg) {
+        if ((a_exp | b_exp) == 0) {
+            return float_relation_equal;
+        }
+        return a_neg ? float_relation_less : float_relation_greater;
+    }
+
+    if (a_exp == b_exp && a.low == b.low) {
+        return float_relation_equal;
+    }
+
+    bool a_smaller = a_exp != b_exp ? a_exp < b_exp : a.low < b.low;
+    return a_smaller != a_neg ? float_relation_less : float_relation_greater;
+}
+
+static inline
+floatx80 float32_to_floatx80__hard(float32 val, float_status *status)
+{
+    uint32_t bits = float32_val(val);
+    int exp = (bits >> 23) & 0xff;
+
+    if (exp == 0 || exp == 0xff) {
+        if ((bits << 1) == 0) {
+            return (floatx80){ .low = 0, .high = (bits >> 31) << 15 };
+        }
+        return float32_to_floatx80(val, status);
+    }
+
+    return (floatx80){
+        .low = (1ULL << 63) | ((uint64_t)(bits & 0x7fffff) << 40),
+        .high = ((bits >> 31) << 15) | (exp + EXPBIAS - HARD_F32_EXP_BIAS),
+    };
+}
+
+static inline
+float32 floatx80_to_float32__hard(floatx80 a, float_status *status)
+{
+    uint32_t sign = (uint32_t)(a.high >> 15) << 31;
+    int exp = a.high & 0x7fff;
+
+    if (exp == 0 && a.low == 0) {
+        return make_float32(sign);
+    }
+
+    exp += HARD_F32_EXP_BIAS - EXPBIAS;
+    /* The largest exponent is left out, rounding up could overflow */
+    if (status->float_rounding_mode != float_round_nearest_even ||
+        !(a.low >> 63) || exp <= 0 || exp >= 0xfe) {
+        return floatx80_to_float32(a, status);
+    }
+
+    uint64_t rem = a.low & 0xffffffffffULL;
+    uint32_t bits = ((uint32_t)exp << 23) | ((a.low >> 40) & 0x7fffff);
+    if (rem > 0x8000000000ULL || (rem == 0x8000000000ULL && (bits & 1))) {
+        bits++;
+    }
+    return make_float32(sign | bits);
+}
+
+static inline
+floatx80 float64_to_floatx80__hard(float64 val, float_status *status)
+{
+    floatx80 ret;
+
+    if (hard_f64_to_floatx80(hard_f64_from_bits(float64_val(val)), &ret)) {
+        return ret;
+    }
+    return float64_to_floatx80(val, status);
+}
+
+static inline
+float64 floatx80_to_float64__hard(floatx80 a, float_status *status)
+{
+    uint64_t sign = (uint64_t)(a.high >> 15) << 63;
+    int exp = a.high & 0x7fff;
+
+    if (exp == 0 && a.low == 0) {
+        return make_float64(sign);
+    }
+
+    exp += HARD_F64_EXP_BIAS - EXPBIAS;
+    /* The largest exponent is left out, rounding up could overflow */
+    if (status->float_rounding_mode != float_round_nearest_even ||
+        !(a.low >> 63) || exp <= 0 || exp >= 0x7fe) {
+        return floatx80_to_float64(a, status);
+    }
+
+    uint64_t rem = a.low & 0x7ff;
+    uint64_t bits = ((uint64_t)exp << 52) | ((a.low << 1) >> 12);
+    if (rem > 0x400 || (rem == 0x400 && (bits & 1))) {
+        bits++;
+    }
+    return make_float64(sign | bits);
+}
+
+static inline
+floatx80 int32_to_floatx80__hard(int32_t a, float_status *status)
+{
+    if (a == 0) {
+        return (floatx80){ .low = 0, .high = 0 };
+    }
+
+    uint64_t mag = a < 0 ? -(uint64_t)a : (uint64_t)a;
+    int shift = clz64(mag);
+    return (floatx80){
+        .low = mag << shift,
+        .high = (a < 0 ? 0x8000 : 0) | (EXPBIAS + 63 - shift),
+    };
+}
+
+#endif /* __aarch64__ */
 
 #define floatx80_add          floatx80_add__hard
 #define floatx80_sub          floatx80_sub__hard
@@ -264,7 +521,7 @@ floatx80 int32_to_floatx80__hard(int32_t a, float_status *status)
 #define helper_fsave          MAP_HELPER_SOFT_HARD(fsave)
 #define helper_frstor         MAP_HELPER_SOFT_HARD(frstor)
 
-#endif /* defined(XBOX) && defined(__x86_64__) */
+#endif /* defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__)) */
 
 static inline void fpush(CPUX86State *env)
 {

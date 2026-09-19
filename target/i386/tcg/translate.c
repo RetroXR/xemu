@@ -37,10 +37,17 @@
 
 static int g_use_hard_fpu;
 
-#if defined(XBOX) && defined(__x86_64__)
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
 #include "ui/xemu-settings.h"
+/*
+ * The TCG floating point ops that g_use_hard_fpu selects only exist in the
+ * x86-64 backend. Other hosts generate the same code as without hard FPU and
+ * have it call the __hard helpers.
+ */
+static int g_use_hard_fpu_helpers;
 #define MAP_GEN_HELPER_SOFT_HARD(name) \
-    (g_use_hard_fpu ? gen_helper_##name##__hard : gen_helper_##name##__soft)
+    (g_use_hard_fpu_helpers ? gen_helper_##name##__hard : \
+                              gen_helper_##name##__soft)
 #define gen_helper_flds_FT0       MAP_GEN_HELPER_SOFT_HARD(flds_FT0)
 #define gen_helper_fldl_FT0       MAP_GEN_HELPER_SOFT_HARD(fldl_FT0)
 #define gen_helper_fildl_FT0      MAP_GEN_HELPER_SOFT_HARD(fildl_FT0)
@@ -121,7 +128,7 @@ static int g_use_hard_fpu;
 #define gen_helper_fldenv         MAP_GEN_HELPER_SOFT_HARD(fldenv)
 #define gen_helper_fsave          MAP_GEN_HELPER_SOFT_HARD(fsave)
 #define gen_helper_frstor         MAP_GEN_HELPER_SOFT_HARD(frstor)
-#endif /* defined(XBOX) && defined(__x86_64__) */
+#endif /* defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__)) */
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -4227,8 +4234,11 @@ void tcg_x86_init(void)
     fpstt = tcg_global_mem_new_i32(tcg_env,
                                    offsetof(CPUX86State, fpstt), "fpstt");
 
-#if defined(XBOX) && defined(__x86_64__)
+#if defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__))
+    g_use_hard_fpu_helpers = g_config.perf.hard_fpu;
+#if defined(__x86_64__)
     g_use_hard_fpu = g_config.perf.hard_fpu;
+#endif
 #endif
 }
 
