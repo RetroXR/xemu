@@ -1314,6 +1314,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
                 upload_texture_image(pg, texture_idx, snode);
                 snode->hash = content_hash;
             }
+            snode->possibly_dirty = false;
         }
 
         NV2A_VK_DGROUP_END();
