@@ -33,6 +33,7 @@
 #include "ui/console.h"
 #include "ui/xemu-settings.h"
 #include "ui/xemu-widescreen.h"
+#include "hw/xbox/nv2a/debug.h"
 #include "hw/xbox/nv2a/nv2a.h"
 #include "xemu-libretro.h"
 #include "libretro.h"
@@ -489,6 +490,43 @@ void xemu_libretro_video_pump_events(void)
 #endif
 }
 
+/* Per guest frame averages of the renderer's counters since the last call */
+static void log_renderer_stats(void)
+{
+    static unsigned int last_frame_count;
+    unsigned int frames = g_nv2a_stats.frame_count - last_frame_count;
+    last_frame_count = g_nv2a_stats.frame_count;
+    if (frames == 0) {
+        return;
+    }
+    frames = MIN(frames, NV2A_PROF_NUM_FRAMES);
+
+    GString *line = g_string_new(NULL);
+    int64_t ms = 0;
+    for (unsigned int i = 0; i < frames; i++) {
+        unsigned int idx = (g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES -
+                            1 - i) % NV2A_PROF_NUM_FRAMES;
+        ms += g_nv2a_stats.frame_history[idx].mspf;
+    }
+    g_string_append_printf(line, "frames=%u mspf=%.1f", frames,
+                           (double)ms / frames);
+    for (unsigned int cnt = 0; cnt < NV2A_PROF__COUNT; cnt++) {
+        int64_t sum = 0;
+        for (unsigned int i = 0; i < frames; i++) {
+            unsigned int idx = (g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES -
+                                1 - i) % NV2A_PROF_NUM_FRAMES;
+            sum += g_nv2a_stats.frame_history[idx].counters[cnt];
+        }
+        if (sum) {
+            g_string_append_printf(line, " %s=%.1f",
+                                   nv2a_profile_get_counter_name(cnt),
+                                   (double)sum / frames);
+        }
+    }
+    xemu_libretro_log(RETRO_LOG_DEBUG, "nv2a: %s\n", line->str);
+    g_string_free(line, TRUE);
+}
+
 bool xemu_libretro_video_render(XemuLibretroFrame *frame)
 {
     static int debug = -1;
@@ -528,6 +566,7 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
     if (debug && (debug_count++ % 120) == 0) {
         xemu_libretro_log(RETRO_LOG_DEBUG, "render: %s ok=%d screen_off=%d\n",
                           path, ok, nv2a_get_screen_off());
+        log_renderer_stats();
     }
 
     if (!ok) {
