@@ -97,6 +97,23 @@ static struct retro_core_option_v2_definition definitions[] = {
         "enabled",
     },
     {
+        "xemu_hdd_location",
+        "System > Hard Disk Image",
+        "Hard Disk Image",
+        "Game saves are stored on the hard disk. By default the image and "
+        "the EEPROM in the system directory are copied to the save directory "
+        "once, and the copies are used from then on. Large images with "
+        "installed software may be better used in place." RESTART,
+        NULL,
+        "system",
+        {
+            { "save", "Copy in the save directory" },
+            { "system", "System directory, in place" },
+            { NULL, NULL },
+        },
+        "save",
+    },
+    {
         "xemu_renderer",
         "Video > Renderer",
         "Renderer",

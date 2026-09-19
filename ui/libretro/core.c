@@ -31,7 +31,10 @@
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
+#include "block/accounting.h"
+#include "block/block-global-state.h"
 #include "ui/console.h"
+#include "system/block-backend.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
 #include "system/system.h"
@@ -355,6 +358,36 @@ static void process_commands(void)
     g_mutex_unlock(&state_lock);
 }
 
+/*
+ * Frontends on mobile devices get killed without unloading the core, and the
+ * images only reach the disk when the guest or a pause flushes them. Flush
+ * once the guest has stopped writing, which is when a save is complete.
+ */
+static void flush_written_disks(void)
+{
+    static int64_t next_check;
+    static uint64_t seen_bytes, flushed_bytes;
+
+    int64_t now = g_get_monotonic_time();
+    if (now < next_check) {
+        return;
+    }
+    next_check = now + G_USEC_PER_SEC;
+
+    xemu_main_loop_lock();
+    uint64_t written = 0;
+    for (BlockBackend *blk = blk_all_next(NULL); blk;
+         blk = blk_all_next(blk)) {
+        written += blk_get_stats(blk)->nr_bytes[BLOCK_ACCT_WRITE];
+    }
+    if (written != flushed_bytes && written == seen_bytes) {
+        bdrv_flush_all();
+        flushed_bytes = written;
+    }
+    seen_bytes = written;
+    xemu_main_loop_unlock();
+}
+
 static void *core_thread_fn(void *opaque)
 {
     if (!xemu_libretro_video_init()) {
@@ -388,6 +421,7 @@ static void *core_thread_fn(void *opaque)
         xemu_libretro_video_pump_events();
 
         process_commands();
+        flush_written_disks();
 
         g_mutex_lock(&state_lock);
         if (frame_state != FRAME_REQUESTED) {
@@ -544,6 +578,74 @@ static char *find_file(const char *dirs[], const char *names[],
     return NULL;
 }
 
+static bool copy_file(const char *src, const char *dst)
+{
+    FILE *in = qemu_fopen(src, "rb");
+    if (!in) {
+        return false;
+    }
+
+    /* Under another name until it is complete */
+    char *tmp = g_strconcat(dst, ".part", NULL);
+    FILE *out = qemu_fopen(tmp, "wb");
+    bool ok = out != NULL;
+
+    size_t len;
+    char *buf = g_malloc(1024 * 1024);
+    while (ok && (len = fread(buf, 1, 1024 * 1024, in)) > 0) {
+        ok = fwrite(buf, 1, len, out) == len;
+    }
+    g_free(buf);
+
+    ok = ok && !ferror(in);
+    fclose(in);
+    if (out) {
+        ok = fclose(out) == 0 && ok;
+    }
+    ok = ok && g_rename(tmp, dst) == 0;
+    if (!ok) {
+        g_remove(tmp);
+    }
+    g_free(tmp);
+    return ok;
+}
+
+/*
+ * The machine writes to its hard disk image and EEPROM, which makes them save
+ * data. They are kept in the save directory, starting out as a copy of what is
+ * in the system directory. Returns the path to use, or NULL to use @src.
+ */
+static char *get_save_copy(const char *src, const char *name)
+{
+    const char *save_dir = NULL;
+    if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) ||
+        !save_dir || !*save_dir) {
+        return NULL;
+    }
+
+    char *dir = g_build_filename(save_dir, "xemu", NULL);
+    char *dst = g_build_filename(dir, name, NULL);
+    g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
+
+    if (g_file_test(dst, G_FILE_TEST_IS_REGULAR)) {
+        return dst;
+    }
+    if (!src) {
+        /* Created there by the machine */
+        return dst;
+    }
+
+    xemu_libretro_log(RETRO_LOG_INFO, "Copying %s to %s\n", src, dst);
+    if (!copy_file(src, dst)) {
+        xemu_libretro_log(RETRO_LOG_WARN, "Failed to copy %s to %s, using it "
+                          "in place\n", src, dst);
+        g_free(dst);
+        return NULL;
+    }
+    return dst;
+}
+
 static void show_message(const char *msg)
 {
     struct retro_message m = { msg, 600 };
@@ -568,7 +670,7 @@ static bool configure(const char *game_path)
     g_free(system_name);
     g_mkdir_with_parents(xemu_dir, 0755);
 
-    /* Shader cache, EEPROM and the optional xemu.toml all live here */
+    /* The shader cache and the optional xemu.toml live here */
     char *base_path = g_strconcat(xemu_dir, G_DIR_SEPARATOR_S, NULL);
     xemu_settings_set_base_path(base_path);
     g_free(base_path);
@@ -604,19 +706,32 @@ static bool configure(const char *game_path)
                                  path ?: "");
         g_free(path);
     }
+    /* Paths from an xemu.toml are used as they are */
+    bool in_place = variable_is("xemu_hdd_location", "system", false);
     if (!g_file_test(g_config.sys.files.hdd_path, G_FILE_TEST_IS_REGULAR)) {
         char *path = find_file(dirs, hdd_names, ".qcow2", NULL);
-        xemu_settings_set_string(&g_config.sys.files.hdd_path, path ?: "");
+        char *copy = in_place ? NULL : get_save_copy(path, hdd_names[0]);
+        if (copy && !path && !g_file_test(copy, G_FILE_TEST_IS_REGULAR)) {
+            /* Unlike the EEPROM, nothing creates a hard disk image */
+            g_free(copy);
+            copy = NULL;
+        }
+        xemu_settings_set_string(&g_config.sys.files.hdd_path,
+                                 copy ?: path ?: "");
+        g_free(copy);
         g_free(path);
     }
 
     if (!g_file_test(g_config.sys.files.eeprom_path, G_FILE_TEST_IS_REGULAR)) {
         /* Generated on first start when there is none */
         char *path = find_file(dirs, eeprom_names, "eeprom.bin", eeprom_sizes);
-        if (!path) {
+        char *copy = in_place ? NULL : get_save_copy(path, eeprom_names[0]);
+        if (!copy && !path) {
             path = g_build_filename(xemu_dir, eeprom_names[0], NULL);
         }
-        xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
+        xemu_settings_set_string(&g_config.sys.files.eeprom_path,
+                                 copy ?: path);
+        g_free(copy);
         g_free(path);
     }
 

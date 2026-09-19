@@ -55,7 +55,18 @@ directly in the system directory):
 | `xbox_hdd.qcow2` | Hard disk image |
 | `xbox_eeprom.bin` | Optional, generated on first start |
 
-The shader cache is written to the same folder. An `xemu.toml` placed there is
+The machine writes to its hard disk (game saves, caches, profiles) and its
+EEPROM (dashboard settings), so those are save data: on first use they are
+copied to `<save directory>/xemu/`, and from then on only the copies are used
+and the files in the system directory stay as they were. Delete the copies to
+start over. The "Hard Disk Image" core option uses the image in the system
+directory in place instead, which suits large images with installed software.
+Memory units enabled through the core options are 8 MiB FATX images in the
+same folder of the save directory. Written images are flushed once the guest
+stops writing, so that a frontend that gets killed does not take a save with
+it.
+
+The shader cache is written to the system folder. An `xemu.toml` placed there is
 read like the standalone configuration file (it is never written back), which
 is the way to reach settings that have no core option; core options win where
 both exist.
@@ -96,10 +107,12 @@ again in the same process, so this is not a conventional core:
   analog triggers, both sticks, rumble. RetroPad B/A/Y/X are A/B/X/Y, L/R are
   White/Black, L2/R2 the triggers, Select is Back.
 - Core options (v2 with categories, v1 fallback): memory, AV pack, boot
-  animation, hard FPU, renderer, internal resolution scale, aspect ratio, output
-  filtering, shader cache, DSP, HRTF, and a memory unit per port.
+  animation, hard FPU, hard disk location, renderer, internal resolution scale,
+  aspect ratio, output filtering, shader cache, DSP, HRTF, and a memory unit
+  per port.
 - `xemu_libretro.info` in this directory is the matching core info file.
 
 Set `XEMU_LIBRETRO_LOG=<file>` to send the core's stdout/stderr (QEMU's own
 messages do not go through the frontend's log interface) to a file, and
-`XEMU_LIBRETRO_DEBUG=1` for periodic notes about the video path.
+`XEMU_LIBRETRO_DEBUG=1` for periodic notes about the video path and the
+renderer's counters.
