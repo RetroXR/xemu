@@ -37,6 +37,10 @@ extern "C" {
  * xemu. The functions below are the mailboxes between the two.
  */
 
+/* Take the locks a thread needs to call into QEMU, as ui/xemu.c does */
+void xemu_main_loop_lock(void);
+void xemu_main_loop_unlock(void);
+
 /* Logging through the frontend log interface, falling back to stderr */
 void xemu_libretro_log(int level, const char *fmt, ...)
     G_GNUC_PRINTF(2, 3);
@@ -73,8 +77,13 @@ typedef struct XemuLibretroFrame {
     bool widescreen;
 } XemuLibretroFrame;
 
+struct DisplaySurface;
+
 bool xemu_libretro_video_init(void);
+void xemu_libretro_video_set_surface(struct DisplaySurface *surface);
 bool xemu_libretro_video_make_current(void);
+void xemu_libretro_video_release_current(void);
+void xemu_libretro_video_pump_events(void);
 void xemu_libretro_video_finalize(void);
 void xemu_libretro_video_set_scale(unsigned scale, unsigned max_width,
                                    unsigned max_height);

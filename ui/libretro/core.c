@@ -40,14 +40,12 @@
 #include "hw/xbox/nv2a/nv2a.h"
 #include "ui/xemu-input.h"
 #include "ui/xemu-settings.h"
-#include "ui/xui/xemu-hud.h"
 #include "xemu-version.h"
 #include "xemu-libretro.h"
 #include "libretro.h"
 
 #include <locale.h>
 #include <glib/gstdio.h>
-#include <SDL3/SDL.h>
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -103,8 +101,6 @@ static enum { ASPECT_AUTO, ASPECT_4_3, ASPECT_16_9 } aspect_mode;
 static int surface_scale = 1;
 static bool game_loaded;
 
-void xemu_libretro_video_set_surface(DisplaySurface *surface);
-
 /* ------------------------------------------------------------------------ */
 
 void xemu_libretro_log(int level, const char *fmt, ...)
@@ -135,22 +131,7 @@ void xemu_main_loop_unlock(void)
     qemu_mutex_unlock_main_loop();
 }
 
-/* There is no window to speak of */
-SDL_Window *xemu_get_window(void)
-{
-    return NULL;
-}
-
-int xemu_is_fullscreen(void)
-{
-    return 0;
-}
-
-void xemu_toggle_fullscreen(void)
-{
-}
-
-void xemu_eject_disc(Error **errp)
+static void eject_disc(Error **errp)
 {
     Error *error = NULL;
 
@@ -165,7 +146,7 @@ void xemu_eject_disc(Error **errp)
     xbox_smc_update_tray_state();
 }
 
-void xemu_load_disc(const char *path, Error **errp)
+static void load_disc(const char *path, Error **errp)
 {
     Error *error = NULL;
 
@@ -210,6 +191,20 @@ static const DisplayChangeListenerOps dcl_ops = {
     .dpy_gfx_check_format = xlr_gfx_check_format,
 };
 
+/* Sleep for most of the wait, then spin: sleeping alone is too coarse */
+static void delay_until(int64_t deadline_ns)
+{
+    const int64_t spin_ns = 1500000;
+
+    int64_t remaining = deadline_ns - qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (remaining > spin_ns) {
+        g_usleep((remaining - spin_ns) / 1000);
+    }
+    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline_ns) {
+        /* spin */
+    }
+}
+
 static void *vblank_thread_fn(void *opaque)
 {
     int64_t next_vblank = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -219,7 +214,7 @@ static void *vblank_thread_fn(void *opaque)
 
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (now < next_vblank) {
-            SDL_DelayPrecise(next_vblank - now);
+            delay_until(next_vblank);
         } else if (now > next_vblank + VBLANK_INTERVAL_NS) {
             next_vblank = now;
         }
@@ -298,14 +293,14 @@ static void process_commands(void)
     g_mutex_lock(&state_lock);
     bool reset = cmd_reset, pause = cmd_pause, resume = cmd_resume;
     bool eject = cmd_eject, sync_ports = cmd_sync_ports;
-    char *load_disc = cmd_load_disc;
+    char *disc_path = cmd_load_disc;
     int scale = cmd_scale;
     cmd_reset = cmd_pause = cmd_resume = cmd_eject = cmd_sync_ports = false;
     cmd_load_disc = NULL;
     cmd_scale = 0;
     g_mutex_unlock(&state_lock);
 
-    if (!reset && !pause && !resume && !eject && !sync_ports && !load_disc &&
+    if (!reset && !pause && !resume && !eject && !sync_ports && !disc_path &&
         !scale) {
         return;
     }
@@ -323,18 +318,18 @@ static void process_commands(void)
     }
     if (eject) {
         Error *err = NULL;
-        xemu_eject_disc(&err);
+        eject_disc(&err);
         if (err) {
             error_report_err(err);
         }
     }
-    if (load_disc) {
+    if (disc_path) {
         Error *err = NULL;
-        xemu_load_disc(load_disc, &err);
+        load_disc(disc_path, &err);
         if (err) {
             error_report_err(err);
         }
-        g_free(load_disc);
+        g_free(disc_path);
     }
     if (reset) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
@@ -352,7 +347,8 @@ static void *core_thread_fn(void *opaque)
         set_core_state(CORE_FAILED);
         return NULL;
     }
-    SDL_GL_MakeCurrent(NULL, NULL);
+    /* The renderer takes its contexts from here to its own thread */
+    xemu_libretro_video_release_current();
 
     qemu_sem_init(&display_init_sem, 0);
     qemu_thread_create(&qemu_thread, "qemu_main", qemu_thread_fn, NULL,
@@ -375,8 +371,7 @@ static void *core_thread_fn(void *opaque)
     set_core_state(CORE_RUNNING);
 
     while (!qatomic_read(&qemu_exiting)) {
-        /* Hidden windows still own a message queue that has to be served */
-        SDL_PumpEvents();
+        xemu_libretro_video_pump_events();
 
         process_commands();
 

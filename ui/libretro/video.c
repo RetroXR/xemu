@@ -1,10 +1,16 @@
 /*
  * xemu libretro frontend - video
  *
- * The NV2A renderers hand out the guest framebuffer as a GL texture that
- * lives in a context group owned by the core. The frame is drawn into an
- * offscreen FBO and read back, so the core works with any frontend video
- * driver.
+ * The core always hands the frontend a software framebuffer, which keeps it
+ * independent of the frontend's video driver. Where the frame comes from
+ * depends on the renderer:
+ *
+ * - The OpenGL renderer hands out a texture in a context group owned by the
+ *   core. It is drawn into an FBO and read back.
+ * - The Vulkan renderer reads its display image back itself. No GL is
+ *   involved, which is what makes platforms without desktop GL possible.
+ * - When the guest does not use the GPU at all, the VGA surface in guest
+ *   memory is used, as the standalone UI does.
  *
  * Copyright (c) 2026 xemu contributors
  *
@@ -27,13 +33,63 @@
 #include "ui/console.h"
 #include "ui/xemu-settings.h"
 #include "ui/xemu-widescreen.h"
-#include "ui/xui/xemu-hud.h"
 #include "hw/xbox/nv2a/nv2a.h"
 #include "xemu-libretro.h"
 #include "libretro.h"
 
+#ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
 #include <SDL3/SDL.h>
+#endif
+
+static unsigned max_width = 1920, max_height = 1080;
+static unsigned surface_scale = 1;
+
+static uint32_t *frame_buf;
+static size_t frame_buf_size;
+
+static GMutex surface_lock;
+static DisplaySurface *vga_surface;
+
+void xemu_libretro_video_set_surface(DisplaySurface *surface)
+{
+    g_mutex_lock(&surface_lock);
+    vga_surface = surface;
+    g_mutex_unlock(&surface_lock);
+}
+
+void xemu_libretro_video_set_scale(unsigned scale, unsigned width,
+                                   unsigned height)
+{
+    surface_scale = MAX(1, scale);
+    max_width = width;
+    max_height = height;
+}
+
+static void reserve_frame(unsigned width, unsigned height)
+{
+    size_t size = (size_t)width * height * sizeof(uint32_t);
+    if (size > frame_buf_size) {
+        frame_buf = g_realloc(frame_buf, size);
+        frame_buf_size = size;
+    }
+}
+
+/* Keep what is handed to the frontend within the advertised maximum */
+static void fit_size(unsigned *width, unsigned *height)
+{
+    if (*width > max_width || *height > max_height) {
+        double scale = MIN((double)max_width / *width,
+                           (double)max_height / *height);
+        *width = MAX(1, (unsigned)(*width * scale));
+        *height = MAX(1, (unsigned)(*height * scale));
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* OpenGL renderer: draw the texture into an FBO and read it back           */
+
+#ifdef CONFIG_OPENGL
 
 static SDL_Window *window;
 static SDL_GLContext context;
@@ -43,14 +99,6 @@ static GLint flip_loc, tex_loc, palette_loc;
 
 static GLuint fbo, fbo_tex;
 static unsigned fbo_width, fbo_height;
-static unsigned max_width = 1920, max_height = 1080;
-static unsigned surface_scale = 1;
-
-static uint32_t *frame_buf;
-static size_t frame_buf_size;
-
-static GMutex surface_lock;
-static DisplaySurface *vga_surface;
 
 static const char *vert_src =
     "#version 400 core\n"
@@ -78,15 +126,6 @@ static const char *frag_src =
     "    out_color = vec4(gamma_ch(0, col.r), gamma_ch(1, col.g),"
     " gamma_ch(2, col.b), 1.0);\n"
     "}\n";
-
-void xemu_libretro_video_set_surface(DisplaySurface *surface);
-
-void xemu_libretro_video_set_surface(DisplaySurface *surface)
-{
-    g_mutex_lock(&surface_lock);
-    vga_surface = surface;
-    g_mutex_unlock(&surface_lock);
-}
 
 static GLuint compile_shader(GLenum type, const char *src)
 {
@@ -140,7 +179,7 @@ static bool init_blit(void)
     return true;
 }
 
-bool xemu_libretro_video_init(void)
+static bool init_gl(void)
 {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         xemu_libretro_log(RETRO_LOG_ERROR,
@@ -190,76 +229,7 @@ bool xemu_libretro_video_init(void)
     xemu_libretro_log(RETRO_LOG_INFO, "GL_VERSION: %s\n",
                       glGetString(GL_VERSION));
 
-    if (!init_blit()) {
-        return false;
-    }
-
-    /* Creates the renderer contexts, shared with the one current now */
-    nv2a_context_init();
-
-    SDL_GL_MakeCurrent(window, context);
-    return true;
-}
-
-bool xemu_libretro_video_make_current(void)
-{
-    return SDL_GL_MakeCurrent(window, context);
-}
-
-void xemu_libretro_video_finalize(void)
-{
-    g_free(frame_buf);
-    frame_buf = NULL;
-    frame_buf_size = 0;
-
-    if (context) {
-        SDL_GL_MakeCurrent(NULL, NULL);
-        SDL_GL_DestroyContext(context);
-        context = NULL;
-    }
-    if (window) {
-        SDL_DestroyWindow(window);
-        window = NULL;
-    }
-}
-
-void xemu_libretro_video_set_scale(unsigned scale, unsigned width,
-                                   unsigned height)
-{
-    surface_scale = MAX(1, scale);
-    max_width = width;
-    max_height = height;
-}
-
-static void upload_vga_surface(DisplaySurface *surface)
-{
-    GLenum format, type;
-
-    switch (surface_format(surface)) {
-    case PIXMAN_BE_b8g8r8x8:
-    case PIXMAN_BE_b8g8r8a8:
-        format = GL_BGRA;
-        type = GL_UNSIGNED_BYTE;
-        break;
-    case PIXMAN_BE_x8r8g8b8:
-    case PIXMAN_BE_a8r8g8b8:
-        format = GL_RGBA;
-        type = GL_UNSIGNED_BYTE;
-        break;
-    case PIXMAN_r5g6b5:
-        format = GL_RGB;
-        type = GL_UNSIGNED_SHORT_5_6_5;
-        break;
-    default:
-        g_assert_not_reached();
-    }
-
-    glPixelStorei(GL_UNPACK_ROW_LENGTH,
-                  surface_stride(surface) / surface_bytes_per_pixel(surface));
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, surface_width(surface),
-                 surface_height(surface), 0, format, type,
-                 surface_data(surface));
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    return init_blit();
 }
 
 static void resize_target(unsigned width, unsigned height)
@@ -283,83 +253,23 @@ static void resize_target(unsigned width, unsigned height)
 
     fbo_width = width;
     fbo_height = height;
-
-    size_t size = (size_t)width * height * sizeof(uint32_t);
-    if (size > frame_buf_size) {
-        frame_buf = g_realloc(frame_buf, size);
-        frame_buf_size = size;
-    }
 }
 
-bool xemu_libretro_video_render(XemuLibretroFrame *frame)
+static bool render_gl_texture(GLuint tex, XemuLibretroFrame *frame)
 {
-    GLuint vga_tex = 0;
-    /*
-     * Renderer surfaces follow the GL convention (origin at the bottom
-     * left), and so does glReadPixels. libretro wants the top row first, so
-     * flip those. Surfaces uploaded from guest memory are already top-down,
-     * which the readback turns into the right order by itself.
-     */
-    bool flip = true;
-
-    GLuint tex = nv2a_get_framebuffer_surface();
-    if (tex == 0) {
-        /*
-         * The guest is not using accelerated rendering. Fall back to the
-         * VGA surface, as the standalone UI does.
-         */
-        xemu_main_loop_lock();
-        g_mutex_lock(&surface_lock);
-        if (vga_surface) {
-            glGenTextures(1, &vga_tex);
-            glBindTexture(GL_TEXTURE_2D, vga_tex);
-            upload_vga_surface(vga_surface);
-        }
-        g_mutex_unlock(&surface_lock);
-        xemu_main_loop_unlock();
-
-        tex = vga_tex;
-        flip = false;
-    }
-
-    static int debug = -1;
-    static unsigned debug_count;
-    if (debug < 0) {
-        debug = g_getenv("XEMU_LIBRETRO_DEBUG") != NULL;
-    }
-    if (debug && (debug_count++ % 120) == 0) {
-        xemu_libretro_log(RETRO_LOG_DEBUG,
-                          "render: %s tex=%u screen_off=%d vga_surface=%p\n",
-                          flip ? "nv2a" : "vga", tex, nv2a_get_screen_off(),
-                          vga_surface);
-    }
-
-    if (tex == 0) {
-        nv2a_release_framebuffer_surface();
-        return false;
-    }
-
     GLint tex_width = 0, tex_height = 0;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_width);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_height);
     if (tex_width <= 0 || tex_height <= 0) {
-        if (vga_tex) {
-            glDeleteTextures(1, &vga_tex);
-        }
-        nv2a_release_framebuffer_surface();
         return false;
     }
 
     unsigned width = tex_width, height = tex_height;
-    if (width > max_width || height > max_height) {
-        double scale = MIN((double)max_width / width,
-                           (double)max_height / height);
-        width = MAX(1, (unsigned)(width * scale));
-        height = MAX(1, (unsigned)(height * scale));
-    }
+    fit_size(&width, &height);
     resize_target(width, height);
+    reserve_frame(width, height);
 
     bool linear = g_config.display.filtering == CONFIG_DISPLAY_FILTERING_LINEAR;
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -387,8 +297,12 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
                          (dac_palette[i * 3 + 1] << 8) | dac_palette[i * 3];
         }
 
+        /*
+         * The texture follows the GL convention (origin at the bottom left),
+         * and so does glReadPixels. libretro wants the top row first.
+         */
         glUseProgram(prog);
-        glUniform1i(flip_loc, flip);
+        glUniform1i(flip_loc, true);
         glUniform1i(tex_loc, 0);
         glUniform1uiv(palette_loc, 256, palette);
         glBindVertexArray(vao);
@@ -399,17 +313,229 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, frame_buf);
 
-    if (vga_tex) {
-        glDeleteTextures(1, &vga_tex);
+    frame->width = width;
+    frame->height = height;
+    frame->widescreen = tex_height / surface_scale >= 720;
+    return true;
+}
+
+#endif /* CONFIG_OPENGL */
+
+/* ------------------------------------------------------------------------ */
+/* Frames that are already in memory                                        */
+
+/* The RAMDAC gamma ramp, or NULL while it is the identity */
+static const uint8_t *get_gamma_ramp(void)
+{
+    const uint8_t *palette = nv2a_get_dac_palette();
+    for (int i = 0; i < 256; i++) {
+        if (palette[i * 3] != i || palette[i * 3 + 1] != i ||
+            palette[i * 3 + 2] != i) {
+            return palette;
+        }
+    }
+    return NULL;
+}
+
+static inline uint32_t apply_gamma(const uint8_t *ramp, uint32_t px)
+{
+    return (ramp[((px >> 16) & 0xff) * 3] << 16) |
+           (ramp[((px >> 8) & 0xff) * 3 + 1] << 8) |
+           ramp[(px & 0xff) * 3 + 2];
+}
+
+/*
+ * Copy XRGB8888 rows into the frame, scaling down (nearest) when the source is
+ * larger than what the frontend was promised.
+ */
+static void copy_xrgb8888(const uint8_t *src, unsigned src_width,
+                          unsigned src_height, int src_stride, bool bottom_up,
+                          XemuLibretroFrame *frame)
+{
+    unsigned width = src_width, height = src_height;
+    fit_size(&width, &height);
+    reserve_frame(width, height);
+
+    const uint8_t *ramp = get_gamma_ramp();
+    bool blank = nv2a_get_screen_off();
+
+    for (unsigned y = 0; y < height; y++) {
+        unsigned sy = (uint64_t)y * src_height / height;
+        if (bottom_up) {
+            sy = src_height - 1 - sy;
+        }
+        const uint32_t *in = (const uint32_t *)(src + (size_t)sy * src_stride);
+        uint32_t *out = frame_buf + (size_t)y * width;
+
+        if (blank) {
+            memset(out, 0, width * sizeof(uint32_t));
+        } else if (width == src_width && !ramp) {
+            memcpy(out, in, width * sizeof(uint32_t));
+        } else {
+            for (unsigned x = 0; x < width; x++) {
+                uint32_t px = in[(uint64_t)x * src_width / width];
+                out[x] = ramp ? apply_gamma(ramp, px) : px;
+            }
+        }
+    }
+
+    frame->width = width;
+    frame->height = height;
+}
+
+static bool copy_vga_surface(XemuLibretroFrame *frame)
+{
+    bool ok = false;
+
+    xemu_main_loop_lock();
+    g_mutex_lock(&surface_lock);
+
+    DisplaySurface *surface = vga_surface;
+    if (surface && surface_width(surface) > 0 && surface_height(surface) > 0) {
+        unsigned width = surface_width(surface);
+        unsigned height = surface_height(surface);
+
+        switch (surface_format(surface)) {
+        case PIXMAN_x8r8g8b8:
+        case PIXMAN_a8r8g8b8:
+            copy_xrgb8888(surface_data(surface), width, height,
+                          surface_stride(surface), false, frame);
+            ok = true;
+            break;
+        case PIXMAN_r5g6b5: {
+            /* Expand into a scratch image first; this is a rare format */
+            uint32_t *tmp = g_malloc((size_t)width * height * 4);
+            for (unsigned y = 0; y < height; y++) {
+                const uint16_t *in =
+                    (const uint16_t *)((uint8_t *)surface_data(surface) +
+                                       (size_t)y * surface_stride(surface));
+                for (unsigned x = 0; x < width; x++) {
+                    unsigned r = in[x] >> 11, g = (in[x] >> 5) & 0x3f,
+                             b = in[x] & 0x1f;
+                    tmp[(size_t)y * width + x] =
+                        ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) |
+                        (b << 3 | b >> 2);
+                }
+            }
+            copy_xrgb8888((uint8_t *)tmp, width, height, width * 4, false,
+                          frame);
+            g_free(tmp);
+            ok = true;
+            break;
+        }
+        default:
+            break;
+        }
+
+        frame->widescreen = height >= 720;
+    }
+
+    g_mutex_unlock(&surface_lock);
+    xemu_main_loop_unlock();
+    return ok;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static bool uses_gl(void)
+{
+#ifdef CONFIG_OPENGL
+    return g_config.display.renderer == CONFIG_DISPLAY_RENDERER_OPENGL;
+#else
+    return false;
+#endif
+}
+
+bool xemu_libretro_video_init(void)
+{
+#ifdef CONFIG_OPENGL
+    if (uses_gl() && !init_gl()) {
+        return false;
+    }
+#endif
+
+    /* The renderer creates its contexts, shared with the one current now */
+    nv2a_context_init();
+
+    return xemu_libretro_video_make_current();
+}
+
+bool xemu_libretro_video_make_current(void)
+{
+#ifdef CONFIG_OPENGL
+    if (uses_gl()) {
+        return SDL_GL_MakeCurrent(window, context);
+    }
+#endif
+    return true;
+}
+
+void xemu_libretro_video_release_current(void)
+{
+#ifdef CONFIG_OPENGL
+    if (uses_gl()) {
+        SDL_GL_MakeCurrent(NULL, NULL);
+    }
+#endif
+}
+
+void xemu_libretro_video_pump_events(void)
+{
+#ifdef CONFIG_OPENGL
+    if (uses_gl()) {
+        /* Hidden windows still own a message queue that has to be served */
+        SDL_PumpEvents();
+    }
+#endif
+}
+
+bool xemu_libretro_video_render(XemuLibretroFrame *frame)
+{
+    static int debug = -1;
+    static unsigned debug_count;
+    const char *path = "none";
+    bool ok = false;
+
+    int tex = nv2a_get_framebuffer_surface();
+    if (tex) {
+#ifdef CONFIG_OPENGL
+        ok = render_gl_texture(tex, frame);
+        path = "gl texture";
+#endif
+    } else {
+        int width, height, stride;
+        const uint8_t *pixels =
+            nv2a_get_framebuffer_pixels(&width, &height, &stride);
+        if (pixels) {
+            /* The display image is composed upside down, for GL's benefit */
+            copy_xrgb8888(pixels, width, height, stride, true, frame);
+            frame->widescreen = height / surface_scale >= 720;
+            path = "readback";
+            ok = true;
+        }
     }
     nv2a_release_framebuffer_surface();
 
+    if (!ok) {
+        /* The guest is not rendering with the GPU */
+        ok = copy_vga_surface(frame);
+        path = "vga";
+    }
+
+    if (debug < 0) {
+        debug = g_getenv("XEMU_LIBRETRO_DEBUG") != NULL;
+    }
+    if (debug && (debug_count++ % 120) == 0) {
+        xemu_libretro_log(RETRO_LOG_DEBUG, "render: %s ok=%d screen_off=%d\n",
+                          path, ok, nv2a_get_screen_off());
+    }
+
+    if (!ok) {
+        return false;
+    }
+
     frame->data = frame_buf;
-    frame->width = width;
-    frame->height = height;
-    frame->pitch = (size_t)width * sizeof(uint32_t);
-    /* 720p and 1080i are widescreen modes; tell them by the native height */
-    unsigned scale = flip ? surface_scale : 1;
-    frame->widescreen = tex_height / scale >= 720 || xemu_get_widescreen();
+    frame->pitch = (size_t)frame->width * sizeof(uint32_t);
+    frame->widescreen |= xemu_get_widescreen();
     return true;
 }
