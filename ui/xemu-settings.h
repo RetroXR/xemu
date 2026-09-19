@@ -45,6 +45,9 @@ extern struct config g_config;
 // Override the default config file paths
 void xemu_settings_set_path(const char *path);
 
+// Override the base path, which must end with a directory separator
+void xemu_settings_set_base_path(const char *path);
+
 // Get the path of the base settings dir
 const char *xemu_settings_get_base_path(void);
 

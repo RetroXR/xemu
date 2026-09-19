@@ -41,6 +41,7 @@ struct config g_config;
 
 static const char *filename = "xemu.toml";
 static const char *settings_path;
+static const char *base_path;
 static std::string error_msg;
 
 const char *xemu_settings_get_error_message(void)
@@ -70,9 +71,16 @@ void xemu_settings_set_path(const char *path)
     fprintf(stderr, "%s: config path: %s\n", __func__, settings_path);
 }
 
+void xemu_settings_set_base_path(const char *path)
+{
+    assert(path != NULL);
+    assert(base_path == NULL);
+    base_path = g_strdup(path);
+    fprintf(stderr, "%s: base path: %s\n", __func__, base_path);
+}
+
 const char *xemu_settings_get_base_path(void)
 {
-    static const char *base_path = NULL;
     if (base_path != NULL) {
         return base_path;
     }
