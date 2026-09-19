@@ -2062,6 +2062,38 @@ static bool debug_skip_draw(PGRAPHVkState *r)
     return skip_gs && r->shader_binding->geom.module_info;
 }
 
+/*
+ * Debugging aid: XEMU_VK_DRAW_CHUNK=<n> splits triangle lists into draws of
+ * at most n triangles, XEMU_VK_DEBUG_DRAWS logs the size of every draw.
+ */
+static void debug_draw(PGRAPHVkState *r, uint32_t count, uint32_t first,
+                       bool indexed)
+{
+    static int chunk = -1, log_draws;
+    if (chunk < 0) {
+        const char *v = getenv("XEMU_VK_DRAW_CHUNK");
+        chunk = v ? atoi(v) * 3 : 0;
+        log_draws = getenv("XEMU_VK_DEBUG_DRAWS") != NULL;
+    }
+
+    int mode = r->shader_binding->state.geom.primitive_mode;
+    if (log_draws) {
+        fprintf(stderr, "draw: mode=%d indexed=%d count=%u", mode, indexed,
+                count);
+        fputc(10, stderr);
+    }
+
+    uint32_t step = (chunk && mode == PRIM_TYPE_TRIANGLES) ? chunk : count;
+    for (uint32_t done = 0; done < count; done += step) {
+        uint32_t n = MIN(step, count - done);
+        if (indexed) {
+            vkCmdDrawIndexed(r->command_buffer, n, 1, first + done, 0, 0);
+        } else {
+            vkCmdDraw(r->command_buffer, n, 1, first + done, 0);
+        }
+    }
+}
+
 void pgraph_vk_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -2104,7 +2136,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
             uint32_t start = pg->draw_arrays_start[i],
                      count = pg->draw_arrays_count[i];
             NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            if (!debug_skip_draw(r)) vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            if (!debug_skip_draw(r)) debug_draw(r, count, start, false);
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2145,8 +2177,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              buffer_offset, VK_INDEX_TYPE_UINT32);
-        if (!debug_skip_draw(r)) vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
-                         0);
+        if (!debug_skip_draw(r)) debug_draw(r, pg->inline_elements_length, 0, true);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 

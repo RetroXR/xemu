@@ -238,13 +238,18 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
         g_file_set_contents(path, glsl_source, -1, NULL);
     }
 
+    /* Debugging aid: SPIR-V 1.5 has discard compile to OpKill, not demote */
+    bool spv15 = getenv("XEMU_VK_SPV15") != NULL;
+
     const glslang_input_t input = {
         .language = GLSLANG_SOURCE_GLSL,
         .stage = stage,
         .client = GLSLANG_CLIENT_VULKAN,
-        .client_version = GLSLANG_TARGET_VULKAN_1_3,
+        .client_version = spv15 ? GLSLANG_TARGET_VULKAN_1_2 :
+                                  GLSLANG_TARGET_VULKAN_1_3,
         .target_language = GLSLANG_TARGET_SPV,
-        .target_language_version = GLSLANG_TARGET_SPV_1_6,
+        .target_language_version = spv15 ? GLSLANG_TARGET_SPV_1_5 :
+                                           GLSLANG_TARGET_SPV_1_6,
         .code = glsl_source,
         .default_version = 460,
         .default_profile = GLSLANG_NO_PROFILE,

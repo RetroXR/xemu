@@ -617,10 +617,20 @@ static void add_final_stage_code(struct PixelShader *ps, struct FCInputInfo fina
             "vec4(t2.rgb, 1.0)", /* 5 */
             "vec4(t3.rgb, 1.0)", /* 6 */
             "vec4(fragColor.rgb, 1.0)", /* 7: combiner result, no blend */
+            /* 8: known data in the right half of surfaces wider than 640 */
+            "gl_FragCoord.x >= 640.0 ? "
+            "vec4(fract(gl_FragCoord.xy / 64.0), 0.5, 1.0) : fragColor",
         };
         int which = atoi(getenv("XEMU_GLSL_DEBUG_FS"));
         which = MIN(MAX(which, 0), (int)ARRAY_SIZE(outputs) - 1);
-        mstring_append_fmt(ps->code, "fragColor = %s;\n", outputs[which]);
+        if (getenv("XEMU_GLSL_DEBUG_WIDE")) {
+            /* Only in the right half of surfaces wider than 640 */
+            mstring_append_fmt(ps->code,
+                               "if (gl_FragCoord.x >= 640.0) fragColor = %s;\n",
+                               outputs[which]);
+        } else {
+            mstring_append_fmt(ps->code, "fragColor = %s;\n", outputs[which]);
+        }
     }
 
     mstring_unref(a);
@@ -1018,7 +1028,46 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (ps->state->interpolate_depth && ps->state->z_perspective) {
+        /*
+         * Without a geometry shader there are no per-primitive vertex
+         * positions to work from. The vertex shader passes w on as the clip
+         * space w, so the rasterizer already interpolates 1/w, and the
+         * slope that the geometry shader derives from the three vertices is
+         * its screen space derivative (per unscaled pixel).
+         */
+        mstring_append(
+            clip,
+            "precise float zvalue = 1.0 / gl_FragCoord.w;\n"
+            "float triMZ_interp =\n"
+            "    max(abs(dFdx(gl_FragCoord.w)) * surfaceScale.x,\n"
+            "        abs(dFdy(gl_FragCoord.w)) * surfaceScale.y);\n"
+            "if (isnan(triMZ_interp) || isinf(triMZ_interp)) {\n"
+            "  triMZ_interp = 0.0;\n"
+            "}\n"
+            "if (zvalue > 0.0) {\n"
+            "  float zslopeofs = depthFactor*triMZ_interp*zvalue*zvalue;\n"
+            "  zvalue += depthOffset;\n"
+            "  zvalue += zslopeofs;\n"
+            "} else {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n"
+            "if (isnan(zvalue)) {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n");
+    } else if (ps->state->interpolate_depth) {
+        /* Likewise for z, which the vertex shader scales by clipRange.y */
+        mstring_append(
+            clip,
+            "precise float zvalue = gl_FragCoord.z * clipRange.y;\n"
+            "float triMZ_interp = max(abs(dFdx(zvalue)) * surfaceScale.x,\n"
+            "                         abs(dFdy(zvalue)) * surfaceScale.y);\n"
+            "if (isnan(triMZ_interp) || isinf(triMZ_interp)) {\n"
+            "  triMZ_interp = 0.0;\n"
+            "}\n"
+            "zvalue += depthOffset;\n"
+            "zvalue += depthFactor*triMZ_interp;\n");
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"

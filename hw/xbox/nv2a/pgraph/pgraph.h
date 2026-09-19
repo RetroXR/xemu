@@ -103,6 +103,12 @@ typedef struct GPUProperties {
         short tri_strip1;
         short tri_fan;
     } geom_shader_winding;
+
+    /*
+     * Set where the geometry shader stage cannot be relied on. Filled
+     * triangles, which do not strictly need one, are then drawn without it.
+     */
+    bool avoid_geometry_shader;
 } GPUProperties;
 
 typedef struct PGRAPHRenderer {

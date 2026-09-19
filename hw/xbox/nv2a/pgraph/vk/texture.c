@@ -934,9 +934,21 @@ static void copy_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
     };
     pgraph_apply_scaling_factor(pg, &region.extent.width,
                                 &region.extent.height);
-    vkCmdCopyImage(cmd, surface->image,
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture->image,
-                   texture->current_layout, 1, &region);
+    if (getenv("XEMU_VK_BLIT_SURF_TO_TEX")) {
+        VkImageBlit blit = {
+            .srcSubresource = region.srcSubresource,
+            .srcOffsets[1] = { region.extent.width, region.extent.height, 1 },
+            .dstSubresource = region.dstSubresource,
+            .dstOffsets[1] = { region.extent.width, region.extent.height, 1 },
+        };
+        vkCmdBlitImage(cmd, surface->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture->image,
+                       texture->current_layout, 1, &blit, VK_FILTER_NEAREST);
+    } else {
+        vkCmdCopyImage(cmd, surface->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture->image,
+                       texture->current_layout, 1, &region);
+    }
 
     pgraph_vk_transition_image_layout(
         pg, cmd, surface->image, surface->host_fmt.vk_format,
@@ -1477,6 +1489,16 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         .pNext = sampler_next_struct,
     };
 
+    /* Debugging aid: plain sampling of the base level only */
+    if (getenv("XEMU_VK_SIMPLE_SAMPLERS")) {
+        sampler_create_info.anisotropyEnable = VK_FALSE;
+        sampler_create_info.maxAnisotropy = 1.0f;
+        sampler_create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler_create_info.minLod = 0.0f;
+        sampler_create_info.maxLod = 0.0f;
+        sampler_create_info.mipLodBias = 0.0f;
+    }
+
     VK_CHECK(vkCreateSampler(r->device, &sampler_create_info, NULL,
                              &snode->sampler));
 
@@ -1541,6 +1563,27 @@ void pgraph_vk_bind_textures(NV2AState *d)
         }
 
         create_texture(pg, i);
+
+        /* Debugging aid: XEMU_VK_DUMMY_TEX=WxH blanks 2D textures of a size */
+        static int dummy_w = -1, dummy_h, dummy_w2, dummy_h2;
+        if (dummy_w < 0) {
+            const char *v = getenv("XEMU_VK_DUMMY_TEX");
+            if (!v || sscanf(v, "%dx%d", &dummy_w, &dummy_h) != 2) {
+                dummy_w = 0;
+            }
+            v = getenv("XEMU_VK_DUMMY_TEX2");
+            if (!v || sscanf(v, "%dx%d", &dummy_w2, &dummy_h2) != 2) {
+                dummy_w2 = 0;
+            }
+        }
+        TextureShape *shape = &r->texture_bindings[i]->key.state;
+        if (!shape->cubemap && shape->dimensionality == 2 &&
+            ((dummy_w && shape->width == dummy_w &&
+              shape->height == dummy_h) ||
+             (dummy_w2 && shape->width == dummy_w2 &&
+              shape->height == dummy_h2))) {
+            r->texture_bindings[i] = &r->dummy_texture;
+        }
 
         pg->texture_dirty[i] = false; // FIXME: Move to renderer?
     }

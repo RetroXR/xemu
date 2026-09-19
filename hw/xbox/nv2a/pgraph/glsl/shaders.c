@@ -33,6 +33,11 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
     pgraph_glsl_set_geom_state(pg, &state.geom);
     pgraph_glsl_set_psh_state(pg, &state.psh);
 
+    state.psh.interpolate_depth =
+        state.geom.avoid_geometry_shader &&
+        state.geom.primitive_mode != PRIM_TYPE_POINTS &&
+        !pgraph_glsl_need_geom(&state.geom);
+
     return state;
 }
 

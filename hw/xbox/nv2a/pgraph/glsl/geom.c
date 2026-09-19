@@ -49,6 +49,8 @@ void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *state)
     if (pg->renderer->ops.get_gpu_properties) {
         GPUProperties *gpu_props = pg->renderer->ops.get_gpu_properties();
 
+        state->avoid_geometry_shader = gpu_props->avoid_geometry_shader;
+
         switch (state->primitive_mode) {
         case PRIM_TYPE_TRIANGLES:
             state->tri_rot0 = gpu_props->geom_shader_winding.tri;
@@ -85,6 +87,19 @@ bool pgraph_glsl_need_geom(const GeomState *state)
     /* FIXME: Missing support for 2-sided-poly mode */
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;
+
+    /*
+     * Filled triangles only go through the geometry shader for the terms of
+     * the depth calculation that are constant across a primitive, and to pick
+     * the provoking vertex when flat shading. The pixel shader can interpolate
+     * depth instead, see interpolate_depth in PshState.
+     */
+    if (state->avoid_geometry_shader && polygon_mode == POLY_MODE_FILL &&
+        (state->primitive_mode == PRIM_TYPE_TRIANGLES ||
+         state->primitive_mode == PRIM_TYPE_TRIANGLE_STRIP ||
+         state->primitive_mode == PRIM_TYPE_TRIANGLE_FAN)) {
+        return false;
+    }
 
     switch (state->primitive_mode) {
     case PRIM_TYPE_POINTS:
@@ -338,20 +353,61 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         provoking_index = "index";
     }
 
+    /*
+     * Read the per-vertex inputs through getters that index them with
+     * constants only. Indexing the input arrays with a run time value is
+     * valid, but the geometry shader compiler of at least the Adreno 7xx
+     * Vulkan driver then hands out garbage for everything but gl_Position.
+     */
+    static const struct {
+        const char *type, *name, *input;
+    } inputs[] = {
+        { "vec4", "Position", "gl_in[%d].gl_Position" },
+        { "float", "PointSize", "gl_in[%d].gl_PointSize" },
+        { "vec4", "D0", "v_vtxD0[%d]" },
+        { "vec4", "D1", "v_vtxD1[%d]" },
+        { "vec4", "B0", "v_vtxB0[%d]" },
+        { "vec4", "B1", "v_vtxB1[%d]" },
+        { "float", "Fog", "v_vtxFog[%d]" },
+        { "vec4", "T0", "v_vtxT0[%d]" },
+        { "vec4", "T1", "v_vtxT1[%d]" },
+        { "vec4", "T2", "v_vtxT2[%d]" },
+        { "vec4", "T3", "v_vtxT3[%d]" },
+        { "vec4", "Pos", "v_vtxPos[%d]" },
+    };
+    int num_input_vertices = strstr(layout_in, "lines_adjacency") ? 4 :
+                             strstr(layout_in, "triangles")       ? 3 :
+                                                                    2;
+    for (int i = 0; i < ARRAY_SIZE(inputs); i++) {
+        mstring_append_fmt(output, "%s in_%s(int i) {\n  switch (i) {\n",
+                           inputs[i].type, inputs[i].name);
+        for (int v = num_input_vertices - 1; v >= 0; v--) {
+            char input[32];
+            snprintf(input, sizeof(input), inputs[i].input, v);
+            if (v == 0) {
+                mstring_append_fmt(output, "  default: return %s;\n", input);
+            } else {
+                mstring_append_fmt(output, "  case %d: return %s;\n", v,
+                                   input);
+            }
+        }
+        mstring_append(output, "  }\n}\n");
+    }
+
     mstring_append_fmt(
         output,
         "void emit_vertex(int index, mat4 pz) {\n"
-        "  gl_Position = gl_in[index].gl_Position;\n"
-        "  gl_PointSize = gl_in[index].gl_PointSize;\n"
-        "  vtxD0 = v_vtxD0[%s];\n"
-        "  vtxD1 = v_vtxD1[%s];\n"
-        "  vtxB0 = v_vtxB0[%s];\n"
-        "  vtxB1 = v_vtxB1[%s];\n"
-        "  vtxFog = v_vtxFog[index];\n"
-        "  vtxT0 = v_vtxT0[index];\n"
-        "  vtxT1 = v_vtxT1[index];\n"
-        "  vtxT2 = v_vtxT2[index];\n"
-        "  vtxT3 = v_vtxT3[index];\n"
+        "  gl_Position = in_Position(index);\n"
+        "  gl_PointSize = in_PointSize(index);\n"
+        "  vtxD0 = in_D0(%s);\n"
+        "  vtxD1 = in_D1(%s);\n"
+        "  vtxB0 = in_B0(%s);\n"
+        "  vtxB1 = in_B1(%s);\n"
+        "  vtxFog = in_Fog(index);\n"
+        "  vtxT0 = in_T0(index);\n"
+        "  vtxT1 = in_T1(index);\n"
+        "  vtxT2 = in_T2(index);\n"
+        "  vtxT3 = in_T3(index);\n"
         "  vtxPos0 = pz[0];\n"
         "  vtxPos1 = pz[1];\n"
         "  vtxPos2 = pz[2];\n"
@@ -385,34 +441,34 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
             mstring_append(
                 output,
                 "mat4 calc_triz(int i0, int i1, int i2) {\n"
-                "  mat2 m = mat2(v_vtxPos[i1].xy - v_vtxPos[i0].xy,\n"
-                "                v_vtxPos[i2].xy - v_vtxPos[i0].xy);\n"
-                "  precise vec2 b = vec2(v_vtxPos[i0].w - v_vtxPos[i1].w,\n"
-                "                        v_vtxPos[i0].w - v_vtxPos[i2].w);\n"
-                "  b /= vec2(v_vtxPos[i1].w, v_vtxPos[i2].w) * v_vtxPos[i0].w;\n"
+                "  mat2 m = mat2(in_Pos(i1).xy - in_Pos(i0).xy,\n"
+                "                in_Pos(i2).xy - in_Pos(i0).xy);\n"
+                "  precise vec2 b = vec2(in_Pos(i0).w - in_Pos(i1).w,\n"
+                "                        in_Pos(i0).w - in_Pos(i2).w);\n"
+                "  b /= vec2(in_Pos(i1).w, in_Pos(i2).w) * in_Pos(i0).w;\n"
                 // The following computes dzx and dzy same as
                 // vec2 dz = b * inverse(m);
                 "  float det = kahan_det(m[0].x, m[1].y, m[1].x, m[0].y);\n"
                 "  float dzx = kahan_det(b.x, m[1].y, b.y, m[0].y) / det;\n"
                 "  float dzy = kahan_det(b.y, m[0].x, b.x, m[1].x) / det;\n"
                 "  float dz = max(abs(dzx), abs(dzy));\n"
-                "  return mat4(v_vtxPos[i0], v_vtxPos[i1], v_vtxPos[i2], dz, vec3(0.0));\n"
+                "  return mat4(in_Pos(i0), in_Pos(i1), in_Pos(i2), dz, vec3(0.0));\n"
                 "}\n");
         } else {
             mstring_append(
                 output,
                 "mat4 calc_triz(int i0, int i1, int i2) {\n"
-                "  mat2 m = mat2(v_vtxPos[i1].xy - v_vtxPos[i0].xy,\n"
-                "                v_vtxPos[i2].xy - v_vtxPos[i0].xy);\n"
-                "  precise vec2 b = vec2(v_vtxPos[i1].z - v_vtxPos[i0].z,\n"
-                "                        v_vtxPos[i2].z - v_vtxPos[i0].z);\n"
+                "  mat2 m = mat2(in_Pos(i1).xy - in_Pos(i0).xy,\n"
+                "                in_Pos(i2).xy - in_Pos(i0).xy);\n"
+                "  precise vec2 b = vec2(in_Pos(i1).z - in_Pos(i0).z,\n"
+                "                        in_Pos(i2).z - in_Pos(i0).z);\n"
                 // The following computes dzx and dzy same as
                 // vec2 dz = b * inverse(m);
                 "  float det = kahan_det(m[0].x, m[1].y, m[1].x, m[0].y);\n"
                 "  float dzx = kahan_det(b.x, m[1].y, b.y, m[0].y) / det;\n"
                 "  float dzy = kahan_det(b.y, m[0].x, b.x, m[1].x) / det;\n"
                 "  float dz = max(abs(dzx), abs(dzy));\n"
-                "  return mat4(v_vtxPos[i0], v_vtxPos[i1], v_vtxPos[i2], dz, vec3(0.0));\n"
+                "  return mat4(in_Pos(i0), in_Pos(i1), in_Pos(i2), dz, vec3(0.0));\n"
                 "}\n");
         }
     }
@@ -423,9 +479,9 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
             // Calculate a third vertex by rotating 90 degrees so that triangle
             // interpolation in fragment shader can be used as is for lines.
             "void emit_line(int i0, int i1, float dz) {\n"
-            "  vec2 delta = v_vtxPos[i1].xy - v_vtxPos[i0].xy;\n"
-            "  vec2 v2 = vec2(-delta.y, delta.x) + v_vtxPos[i0].xy;\n"
-            "  mat4 pz = mat4(v_vtxPos[i0], v_vtxPos[i1], v2, v_vtxPos[i0].zw, dz, vec3(0.0));\n"
+            "  vec2 delta = in_Pos(i1).xy - in_Pos(i0).xy;\n"
+            "  vec2 v2 = vec2(-delta.y, delta.x) + in_Pos(i0).xy;\n"
+            "  mat4 pz = mat4(in_Pos(i0), in_Pos(i1), v2, in_Pos(i0).zw, dz, vec3(0.0));\n"
             "  emit_vertex(i0, pz);\n"
             "  emit_vertex(i1, pz);\n"
             "  EndPrimitive();\n"

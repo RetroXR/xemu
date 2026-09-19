@@ -595,6 +595,19 @@ void pgraph_vk_determine_gpu_properties(NV2AState *d)
                                      &pgraph_vk_gpu_properties);
     g_free(pixels);
 
+    /*
+     * Varyings that pass through a geometry shader come out as garbage on
+     * Adreno as soon as a frame has more than a handful of draws (seen on a
+     * 740 with driver 512.x; positions survive, everything else does not).
+     */
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    const char *avoid = getenv("XEMU_VK_AVOID_GEOMETRY_SHADER");
+    pgraph_vk_gpu_properties.avoid_geometry_shader =
+        avoid ? atoi(avoid) : r->device_props.vendorID == 0x5143 /* Qualcomm */;
+    if (pgraph_vk_gpu_properties.avoid_geometry_shader) {
+        fprintf(stderr, "VK: avoiding the geometry shader stage\n");
+    }
+
     fprintf(stderr, "VK geometry shader winding: %d, %d, %d, %d\n",
             pgraph_vk_gpu_properties.geom_shader_winding.tri,
             pgraph_vk_gpu_properties.geom_shader_winding.tri_strip0,

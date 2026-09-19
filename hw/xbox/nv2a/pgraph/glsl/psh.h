@@ -70,6 +70,12 @@ typedef struct PshState {
     bool depth_clipping;
     bool z_perspective;
 
+    /*
+     * There is no geometry shader to supply the vertex positions of the
+     * primitive: take depth and its slope from the rasterizer instead.
+     */
+    bool interpolate_depth;
+
     unsigned int surface_zeta_format;
     enum PshDepthFormat depth_format;
 } PshState;
