@@ -393,6 +393,7 @@ typedef struct PGRAPHVkState {
     MemorySyncRequirement vertex_ram_buffer_syncs[NV2A_VERTEXSHADER_ATTRIBUTES];
     size_t num_vertex_ram_buffer_syncs;
     unsigned long *uploaded_bitmap;
+    unsigned long *deferred_bitmap;
     size_t bitmap_size;
 
     VkVertexInputAttributeDescription vertex_attribute_descriptions[NV2A_VERTEXSHADER_ATTRIBUTES];
@@ -404,6 +405,7 @@ typedef struct PGRAPHVkState {
     hwaddr vertex_attribute_offsets[NV2A_VERTEXSHADER_ATTRIBUTES];
 
     QTAILQ_HEAD(, SurfaceBinding) surfaces;
+    QTAILQ_HEAD(, SurfaceBinding) shelved_surfaces;
     QTAILQ_HEAD(, SurfaceBinding) invalid_surfaces;
     SurfaceBinding *color_binding, *zeta_binding;
     bool downloads_pending;
@@ -439,6 +441,7 @@ typedef struct PGRAPHVkState {
     bool new_query_needed;
     bool query_in_flight;
     bool query_pool_reset;
+    bool finish_wait_pending;
     uint32_t zpass_pixel_count_result;
     QSIMPLEQ_HEAD(, QueryReport) report_queue; // FIXME: Statically allocate
 
@@ -518,6 +521,8 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
                                       unsigned int inline_stride,
                                       unsigned int provoking_element);
 void pgraph_vk_bind_vertex_attributes_inline(NV2AState *d);
+bool pgraph_vk_vertex_ram_update_needs_finish(PGRAPHState *pg, hwaddr offset,
+                                              VkDeviceSize size);
 void pgraph_vk_update_vertex_ram_buffer(PGRAPHState *pg, hwaddr offset, void *data,
                                     VkDeviceSize size);
 VkDeviceSize pgraph_vk_update_index_buffer(PGRAPHState *pg, void *data,
@@ -609,6 +614,7 @@ void pgraph_vk_clear_surface(NV2AState *d, uint32_t parameter);
 void pgraph_vk_draw_begin(NV2AState *d);
 void pgraph_vk_draw_end(NV2AState *d);
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason why);
+void pgraph_vk_complete_finish(PGRAPHState *pg);
 void pgraph_vk_flush_draw(NV2AState *d);
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg);
 void pgraph_vk_ensure_command_buffer(PGRAPHState *pg);

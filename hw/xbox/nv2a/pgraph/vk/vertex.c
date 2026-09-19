@@ -38,8 +38,9 @@ VkDeviceSize pgraph_vk_update_vertex_inline_buffer(PGRAPHState *pg, void **data,
                                                    size_t count)
 {
     nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_3);
+    /* Attributes are fetched as floats, which need their alignment */
     return pgraph_vk_append_to_buffer(pg, BUFFER_VERTEX_INLINE_STAGING, data,
-                                      sizes, count, 1);
+                                      sizes, count, 4);
 }
 
 void pgraph_vk_update_vertex_ram_buffer(PGRAPHState *pg, hwaddr offset,
@@ -64,6 +65,23 @@ void pgraph_vk_update_vertex_ram_buffer(PGRAPHState *pg, hwaddr offset,
     memcpy(r->storage_buffers[BUFFER_VERTEX_RAM].mapped + offset, data, size);
 
     bitmap_set(r->uploaded_bitmap, start_bit, nbits);
+    bitmap_clear(r->deferred_bitmap, start_bit, nbits);
+}
+
+/*
+ * Whether the pages were already copied to the vertex RAM buffer for draws of
+ * the command buffer that is being recorded, so that copying them again means
+ * finishing it first.
+ */
+bool pgraph_vk_vertex_ram_update_needs_finish(PGRAPHState *pg, hwaddr offset,
+                                              VkDeviceSize size)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    size_t start_bit = offset / TARGET_PAGE_SIZE;
+    size_t end_bit = TARGET_PAGE_ALIGN(offset + size) / TARGET_PAGE_SIZE;
+
+    return r->in_command_buffer &&
+           find_next_bit(r->uploaded_bitmap, end_bit, start_bit) < end_bit;
 }
 
 static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size)

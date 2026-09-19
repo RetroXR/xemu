@@ -1351,12 +1351,44 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
+/*
+ * The second half of pgraph_vk_finish(): wait for the GPU and release what
+ * the command buffer used. The finish at the end of a frame leaves it for
+ * later, see there, and everything that touches the renderer's state or its
+ * buffers calls this first.
+ */
+void pgraph_vk_complete_finish(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (!r->finish_wait_pending) {
+        return;
+    }
+    r->finish_wait_pending = false;
+
+    int64_t start = g_get_monotonic_time();
+    VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence, VK_TRUE,
+                             UINT64_MAX));
+    nv2a_profile_add_counter(NV2A_PROF_GPU_WAIT_US,
+                             g_get_monotonic_time() - start);
+
+    r->descriptor_set_index = 0;
+    destroy_framebuffers(pg);
+
+    /* Collects the results of the queries before their pool is reset */
+    pgraph_vk_process_pending_reports_internal(
+        container_of(pg, NV2AState, pgraph));
+    pgraph_vk_compute_finish_complete(r);
+}
+
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     assert(!r->in_draw);
     assert(r->debug_depth == 0);
+
+    pgraph_vk_complete_finish(pg);
 
     if (r->in_command_buffer) {
         nv2a_profile_inc_counter(finish_reason_to_counter_enum[finish_reason]);
@@ -1396,6 +1428,7 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             }
         };
         nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
+        int64_t submit_start = g_get_monotonic_time();
         vkResetFences(r->device, 1, &r->command_buffer_fence);
         VK_CHECK(vkQueueSubmit(r->queue, ARRAY_SIZE(submit_infos), submit_infos,
                                r->command_buffer_fence));
@@ -1415,11 +1448,31 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             check_budget = true;
         }
 
+        /*
+         * At the end of a frame the puller stops until the flip, which takes
+         * place at the next vblank that finds it stopped. Waiting here for the
+         * GPU to draw the frame first can make that a later vblank, and one
+         * vblank more per frame turns 30 frames per second into 20. The wait
+         * is made up for before the renderer is used again. Reports that the
+         * guest has asked for are written from query results, so they need
+         * the wait now.
+         */
+        bool defer_wait = finish_reason == VK_FINISH_REASON_FLIP_STALL &&
+                          QSIMPLEQ_EMPTY(&r->report_queue);
+        r->in_command_buffer = false;
+        if (defer_wait) {
+            r->finish_wait_pending = true;
+            nv2a_profile_add_counter(NV2A_PROF_GPU_WAIT_US,
+                                     g_get_monotonic_time() - submit_start);
+            return;
+        }
+
         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
                                  VK_TRUE, UINT64_MAX));
+        nv2a_profile_add_counter(NV2A_PROF_GPU_WAIT_US,
+                                 g_get_monotonic_time() - submit_start);
 
         r->descriptor_set_index = 0;
-        r->in_command_buffer = false;
         destroy_framebuffers(pg);
 
         if (check_budget) {
@@ -1440,6 +1493,8 @@ void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     assert(!r->in_command_buffer);
+
+    pgraph_vk_complete_finish(pg);
 
     VkCommandBufferBeginInfo command_buffer_begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1700,13 +1755,22 @@ static int compare_memory_sync_requirement_by_addr(const void *p1,
     return 0;
 }
 
-static void sync_vertex_ram_buffer(PGRAPHState *pg)
+/*
+ * Returns true if the vertex RAM buffer could not be brought up to date: the
+ * guest has rewritten vertex data that earlier draws of this command buffer
+ * use, which dynamic geometry does many times per frame. Finishing the command
+ * buffer to update the buffer costs a round trip to the GPU each time, so the
+ * pages are left for later and the draw takes its vertices from the inline
+ * buffer instead.
+ */
+static bool sync_vertex_ram_buffer(PGRAPHState *pg, bool may_defer)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
+    bool deferred = false;
 
     if (r->num_vertex_ram_buffer_syncs == 0) {
-        return;
+        return false;
     }
 
     // Align sync requirements to page boundaries
@@ -1775,9 +1839,24 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
             ignore_dirty = getenv("XEMU_VK_IGNORE_DIRTY") != NULL;
         }
 
-        if (memory_region_test_and_clear_dirty(d->vram, addr, size,
-                                               DIRTY_MEMORY_NV2A) ||
-            ignore_dirty) {
+        size_t start_bit = addr / TARGET_PAGE_SIZE;
+        size_t end_bit = (addr + size) / TARGET_PAGE_SIZE;
+        bool dirty = memory_region_test_and_clear_dirty(d->vram, addr, size,
+                                                        DIRTY_MEMORY_NV2A) ||
+                     find_next_bit(r->deferred_bitmap, end_bit, start_bit) <
+                         end_bit ||
+                     ignore_dirty;
+        if (!dirty) {
+            continue;
+        }
+
+        if (may_defer &&
+            pgraph_vk_vertex_ram_update_needs_finish(pg, addr, size)) {
+            NV2A_VK_DPRINTF("Memory dirty and in use. Deferring...");
+            pgraph_vk_download_surfaces_in_range_if_dirty(pg, addr, size);
+            bitmap_set(r->deferred_bitmap, start_bit, end_bit - start_bit);
+            deferred = true;
+        } else {
             NV2A_VK_DPRINTF("Memory dirty. Synchronizing...");
             pgraph_vk_update_vertex_ram_buffer(pg, addr, d->vram_ptr + addr,
                                                size);
@@ -1787,6 +1866,7 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
     r->num_vertex_ram_buffer_syncs = 0;
 
     NV2A_VK_DGROUP_END();
+    return deferred;
 }
 
 void pgraph_vk_clear_surface(NV2AState *d, uint32_t parameter)
@@ -2006,7 +2086,8 @@ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
 
 static bool ensure_buffer_space(PGRAPHState *pg, int index, VkDeviceSize size)
 {
-    if (!pgraph_vk_buffer_has_space_for(pg, index, size, 1)) {
+    /* Appending may align the data, by less than this */
+    if (!pgraph_vk_buffer_has_space_for(pg, index, size, 16)) {
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
         return true;
     }
@@ -2056,8 +2137,32 @@ typedef struct VertexBufferRemap {
     } map[NV2A_VERTEXSHADER_ATTRIBUTES];
 } VertexBufferRemap;
 
+/*
+ * Taking the vertices of a draw from the inline buffer means copying all that
+ * lie between the first and the last one it uses. That beats finishing the
+ * command buffer for the small draws of dynamic geometry, and not for an
+ * indexed draw that reaches across a large vertex buffer.
+ */
+#define MAX_STALE_REMAP_SIZE (256 * 1024)
+
+static bool can_remap_all_attributes(PGRAPHState *pg, uint32_t num_vertices)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    size_t vertex_size = 0;
+
+    for (int i = 0; i < r->num_active_vertex_attribute_descriptions; i++) {
+        size_t element_size, element_count;
+        get_size_and_count_for_format(r->vertex_attribute_descriptions[i].format,
+                                      &element_size, &element_count);
+        vertex_size += element_size * element_count;
+    }
+
+    return vertex_size * num_vertices <= MAX_STALE_REMAP_SIZE;
+}
+
 static VertexBufferRemap remap_unaligned_attributes(PGRAPHState *pg,
-                                                    uint32_t num_vertices)
+                                                    uint32_t num_vertices,
+                                                    bool remap_all)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
@@ -2088,7 +2193,7 @@ static VertexBufferRemap remap_unaligned_attributes(PGRAPHState *pg,
             force_remap = getenv("XEMU_VK_REMAP_ALL") != NULL;
         }
 
-        if (offset_valid && stride_valid && !force_remap) {
+        if (offset_valid && stride_valid && !force_remap && !remap_all) {
             continue;
         }
 
@@ -2144,8 +2249,6 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
 
     // FIXME: SIMD memcpy
     // FIXME: Caching
-    // FIXME: Account for only what is drawn
-    assert(start_vertex == 0);
     assert(buffer->mapped);
 
     // Copy vertex data
@@ -2158,7 +2261,8 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
             buffer->buffer_offset + remap.map[attr_id].offset;
 
         uint8_t *out_ptr = buffer->mapped + attr_buffer_offset;
-        uint8_t *in_ptr = d->vram_ptr + r->vertex_attribute_offsets[attr_id];
+        uint8_t *in_ptr = d->vram_ptr + r->vertex_attribute_offsets[attr_id] +
+                          (size_t)start_vertex * remap.map[attr_id].old_stride;
 
         for (int vertex_id = 0; vertex_id < num_vertices; vertex_id++) {
             memcpy(out_ptr, in_ptr, remap.map[attr_id].new_stride);
@@ -2198,7 +2302,7 @@ static bool debug_skip_draw(PGRAPHVkState *r)
  * at most n triangles, XEMU_VK_DEBUG_DRAWS logs the size of every draw.
  */
 static void debug_draw(PGRAPHVkState *r, uint32_t count, uint32_t first,
-                       bool indexed)
+                       bool indexed, int32_t vertex_offset)
 {
     static int chunk = -1, log_draws;
     if (chunk < 0) {
@@ -2218,9 +2322,11 @@ static void debug_draw(PGRAPHVkState *r, uint32_t count, uint32_t first,
     for (uint32_t done = 0; done < count; done += step) {
         uint32_t n = MIN(step, count - done);
         if (indexed) {
-            vkCmdDrawIndexed(r->command_buffer, n, 1, first + done, 0, 0);
+            vkCmdDrawIndexed(r->command_buffer, n, 1, first + done,
+                             vertex_offset, 0);
         } else {
-            vkCmdDraw(r->command_buffer, n, 1, first + done, 0);
+            vkCmdDraw(r->command_buffer, n, 1, first + done + vertex_offset,
+                      0);
         }
     }
 }
@@ -2229,6 +2335,8 @@ void pgraph_vk_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
+
+    pgraph_vk_complete_finish(pg);
 
     if (!(r->color_binding || r->zeta_binding)) {
         NV2A_VK_DPRINTF("No binding present!!!\n");
@@ -2254,11 +2362,16 @@ void pgraph_vk_flush_draw(NV2AState *d)
             min_element = MIN(pg->draw_arrays_start[i], min_element);
             max_element = MAX(max_element, pg->draw_arrays_start[i] + pg->draw_arrays_count[i]);
         }
-        sync_vertex_ram_buffer(pg);
-        VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
+        /* With all attributes remapped only the vertices in use are copied */
+        bool stale = sync_vertex_ram_buffer(
+            pg, can_remap_all_attributes(pg, max_element - min_element));
+        uint32_t first_vertex = stale ? min_element : 0;
+        VertexBufferRemap remap = remap_unaligned_attributes(
+            pg, max_element - first_vertex, stale);
 
         begin_pre_draw(pg);
-        copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
+        copy_remapped_attributes_to_inline_buffer(pg, remap, first_vertex,
+                                                  max_element - first_vertex);
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Draw Arrays");
         begin_draw(pg);
@@ -2267,7 +2380,9 @@ void pgraph_vk_flush_draw(NV2AState *d)
             uint32_t start = pg->draw_arrays_start[i],
                      count = pg->draw_arrays_count[i];
             NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            if (!debug_skip_draw(r)) debug_draw(r, count, start, false);
+            if (!debug_skip_draw(r)) {
+                debug_draw(r, count, start, false, -(int32_t)first_vertex);
+            }
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2294,11 +2409,16 @@ void pgraph_vk_flush_draw(NV2AState *d)
         pgraph_vk_bind_vertex_attributes(
             d, min_element, max_element, false, 0,
             pg->inline_elements[pg->inline_elements_length - 1]);
-        sync_vertex_ram_buffer(pg);
-        VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element + 1);
+        /* With all attributes remapped only the vertices in use are copied */
+        bool stale = sync_vertex_ram_buffer(
+            pg, can_remap_all_attributes(pg, max_element + 1 - min_element));
+        uint32_t first_vertex = stale ? min_element : 0;
+        VertexBufferRemap remap = remap_unaligned_attributes(
+            pg, max_element + 1 - first_vertex, stale);
 
         begin_pre_draw(pg);
-        copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element + 1);
+        copy_remapped_attributes_to_inline_buffer(
+            pg, remap, first_vertex, max_element + 1 - first_vertex);
         VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
             pg, pg->inline_elements, index_data_size);
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
@@ -2308,7 +2428,10 @@ void pgraph_vk_flush_draw(NV2AState *d)
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              buffer_offset, VK_INDEX_TYPE_UINT32);
-        if (!debug_skip_draw(r)) debug_draw(r, pg->inline_elements_length, 0, true);
+        if (!debug_skip_draw(r)) {
+            debug_draw(r, pg->inline_elements_length, 0, true,
+                       -(int32_t)first_vertex);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 

@@ -74,6 +74,8 @@ VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    pgraph_vk_complete_finish(pg);
+
     assert(!r->in_aux_command_buffer);
     r->in_aux_command_buffer = true;
 
@@ -99,9 +101,12 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
     };
+    int64_t start = g_get_monotonic_time();
     VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
     VK_CHECK(vkQueueWaitIdle(r->queue));
+    nv2a_profile_add_counter(NV2A_PROF_GPU_WAIT_AUX_US,
+                             g_get_monotonic_time() - start);
 
     r->in_aux_command_buffer = false;
 }

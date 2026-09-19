@@ -126,6 +126,7 @@ static void pgraph_vk_process_pending(NV2AState *d)
     ) {
         qemu_mutex_unlock(&d->pfifo.lock);
         qemu_mutex_lock(&d->pgraph.lock);
+        pgraph_vk_complete_finish(&d->pgraph);
         if (qatomic_read(&r->downloads_pending)) {
             pgraph_vk_process_pending_downloads(d);
         }

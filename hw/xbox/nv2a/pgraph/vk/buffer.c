@@ -128,6 +128,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
     r->bitmap_size = memory_region_size(d->vram) / 4096;
     r->uploaded_bitmap = bitmap_new(r->bitmap_size);
     bitmap_clear(r->uploaded_bitmap, 0, r->bitmap_size);
+    r->deferred_bitmap = bitmap_new(r->bitmap_size);
 
     r->storage_buffers[BUFFER_VERTEX_INLINE] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
@@ -147,7 +148,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        .buffer_size = 8 * 1024 * 1024,
+        /* A frame of a busy game is 5 MiB, and running out means a finish */
+        .buffer_size = 32 * 1024 * 1024,
     };
 
     r->storage_buffers[BUFFER_UNIFORM_STAGING] = (StorageBuffer){
@@ -217,6 +219,8 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
 
     g_free(r->uploaded_bitmap);
     r->uploaded_bitmap = NULL;
+    g_free(r->deferred_bitmap);
+    r->deferred_bitmap = NULL;
 }
 
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
