@@ -29,6 +29,8 @@ xemu is an original Xbox emulator implemented as a fork of QEMU. The vast majori
 - The frontend's thread must never call into QEMU. Everything goes through the core thread in `ui/libretro/core.c` (it stands in for `main()` of `ui/xemu.c`), via the mutex-protected mailboxes there and in `input.c` / `audio.c`.
 - Many `nv2a_*` helpers (`nv2a_get/set_surface_scale_factor`, ...) drop and retake the BQL internally, so they assert unless called with the BQL held; `nv2a_get_framebuffer_surface()` on the other hand is called without it.
 - The machine is created once per process and the library pins itself at load (QEMU starts its RCU thread from a constructor). "Unload" pauses and ejects, "load" swaps the disc and resets.
+- Frontends load several copies of the core file (libretro-godot: one per instance). Only the module loaded first runs a machine; the others forward the stateful `retro_*` calls to it through the table published in the `XEMU_LIBRETRO_PRIMARY` environment variable. A new API entry point that touches state needs a `FORWARD_TO_PRIMARY` and a slot in `XemuLibretroApi` (bump `PRIMARY_API_VERSION`).
+- The hard disk image and EEPROM are save data: copied once from `<system>/xemu/` to `<save>/xemu/` and used there.
 - `retro_run()` must drain exactly one video frame of audio; the APU paces itself on the fill level of that queue.
 
 ## Tests
