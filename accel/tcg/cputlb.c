@@ -925,6 +925,17 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
         unsigned int n = tlb_n_entries(fast);
         unsigned int i;
 
+#ifdef XBOX
+        /*
+         * This runs for every new TB and every time the NV2A cleans a page.
+         * The Xbox stays in ring 0, and the tables of the other MMU modes
+         * have never held anything that could match.
+         */
+        if (!desc->ever_used) {
+            continue;
+        }
+#endif
+
         for (i = 0; i < n; i++) {
             tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i],
                                          start, length);
@@ -1184,6 +1195,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     copy_tlb_helper_locked(te, &tn);
     tlb_n_used_entries_inc(cpu, mmu_idx);
+#ifdef XBOX
+    desc->ever_used = true;
+#endif
     qemu_spin_unlock(&tlb->c.lock);
 }
 
