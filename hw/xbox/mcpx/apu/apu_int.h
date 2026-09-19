@@ -87,6 +87,7 @@ typedef struct MCPXAPUState {
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
+    uint64_t ram_size;
     MemoryRegion mmio;
 
     MCPXAPUVPState vp;
@@ -122,6 +123,38 @@ typedef struct MCPXAPUState {
         int queued_bytes_low, queued_bytes_high;
     } monitor;
 } MCPXAPUState;
+
+/*
+ * The voice processor reads guest RAM for every sample and every voice
+ * register. Main RAM is mapped at ram_ptr, which spares the address space
+ * lookup. Writes still go through the address space for dirty tracking.
+ */
+static inline const uint8_t *apu_ram_host_ptr(MCPXAPUState *d, hwaddr addr,
+                                              unsigned int size)
+{
+    if (likely(addr + size <= d->ram_size)) {
+        return d->ram_ptr + addr;
+    }
+    return NULL;
+}
+
+static inline uint8_t apu_ldub(MCPXAPUState *d, hwaddr addr)
+{
+    const uint8_t *p = apu_ram_host_ptr(d, addr, 1);
+    return p ? ldub_p(p) : ldub_phys(&address_space_memory, addr);
+}
+
+static inline uint16_t apu_lduw_le(MCPXAPUState *d, hwaddr addr)
+{
+    const uint8_t *p = apu_ram_host_ptr(d, addr, 2);
+    return p ? lduw_le_p(p) : lduw_le_phys(&address_space_memory, addr);
+}
+
+static inline uint32_t apu_ldl_le(MCPXAPUState *d, hwaddr addr)
+{
+    const uint8_t *p = apu_ram_host_ptr(d, addr, 4);
+    return p ? ldl_le_p(p) : ldl_le_phys(&address_space_memory, addr);
+}
 
 extern MCPXAPUState *g_state; // Used via debug handlers
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
