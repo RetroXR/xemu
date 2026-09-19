@@ -134,5 +134,7 @@ void mcpx_debug_end_frame(void);
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp);
 void mcpx_apu_monitor_finalize(MCPXAPUState *d);
 void mcpx_apu_monitor_frame(MCPXAPUState *d);
+bool mcpx_apu_monitor_is_active(MCPXAPUState *d);
+int mcpx_apu_monitor_get_queued_bytes(MCPXAPUState *d);
 
 #endif

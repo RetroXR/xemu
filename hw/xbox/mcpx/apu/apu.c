@@ -176,8 +176,8 @@ static void throttle(MCPXAPUState *d)
     throttle_update_debug(d, start_us);
     int queued_bytes = -1;
 
-    if (d->monitor.stream) {
-        queued_bytes = SDL_GetAudioStreamQueued(d->monitor.stream);
+    if (mcpx_apu_monitor_is_active(d)) {
+        queued_bytes = mcpx_apu_monitor_get_queued_bytes(d);
         if (queued_bytes >= 0) {
             throttle_record_queue(d, queued_bytes);
         }
@@ -186,7 +186,7 @@ static void throttle(MCPXAPUState *d)
             if (d->pause_requested) {
                 break;
             }
-            queued_bytes = SDL_GetAudioStreamQueued(d->monitor.stream);
+            queued_bytes = mcpx_apu_monitor_get_queued_bytes(d);
         }
     }
 

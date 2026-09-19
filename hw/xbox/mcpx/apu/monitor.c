@@ -67,6 +67,16 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
     }
 }
 
+bool mcpx_apu_monitor_is_active(MCPXAPUState *d)
+{
+    return d->monitor.stream != NULL;
+}
+
+int mcpx_apu_monitor_get_queued_bytes(MCPXAPUState *d)
+{
+    return SDL_GetAudioStreamQueued(d->monitor.stream);
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
