@@ -12,7 +12,12 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
+#ifdef XBOX
+/* Games have more hot targets of indirect jumps than 64 slots in 64 pages */
+#define TB_JMP_CACHE_BITS 14
+#else
 #define TB_JMP_CACHE_BITS 12
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
