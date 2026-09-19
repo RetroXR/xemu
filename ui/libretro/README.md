@@ -94,6 +94,13 @@ again in the same process, so this is not a conventional core:
 - The library pins itself in memory when it is loaded. QEMU starts threads
   from constructors, so a frontend that loads the core just to query it and
   unloads it again would otherwise pull the code out from under them.
+- Frontends also load copies of the core file, one per instance they create
+  (libretro-godot does). Every copy is a module with its own QEMU, but the
+  machine has to stay the only one in the process: it holds the disk images.
+  The module loaded first owns it and publishes its entry points in the
+  `XEMU_LIBRETRO_PRIMARY` environment variable; modules loaded later forward
+  their libretro calls there. Only one instance can have content loaded at a
+  time, a second `retro_load_game()` fails with a message.
 - Video is a software framebuffer, which makes the core independent of the
   frontend's video driver at the cost of a readback per frame. The Vulkan
   renderer reads its display image back itself and needs no GL. The OpenGL

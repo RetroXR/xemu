@@ -822,12 +822,88 @@ static bool configure(const char *game_path)
 }
 
 /*
+ * Frontends load a core more than once: to query it, or as a copy of the file
+ * for every instance they create. Each copy is a module with globals and a
+ * QEMU of its own, but there is one machine per process, with its disk images
+ * open. The module that is loaded first owns it and leaves the addresses of
+ * its entry points in the environment, which is the one thing all of them
+ * share, and the ones loaded later forward their calls.
+ */
+#define PRIMARY_ENV_VAR "XEMU_LIBRETRO_PRIMARY"
+#define PRIMARY_API_VERSION 1
+
+typedef struct XemuLibretroApi {
+    void (*set_environment)(retro_environment_t);
+    void (*set_video_refresh)(retro_video_refresh_t);
+    void (*set_audio_sample)(retro_audio_sample_t);
+    void (*set_audio_sample_batch)(retro_audio_sample_batch_t);
+    void (*set_input_poll)(retro_input_poll_t);
+    void (*set_input_state)(retro_input_state_t);
+    void (*init)(void);
+    void (*deinit)(void);
+    void (*get_system_av_info)(struct retro_system_av_info *);
+    void (*set_controller_port_device)(unsigned, unsigned);
+    void (*reset)(void);
+    bool (*load_game)(const struct retro_game_info *);
+    void (*unload_game)(void);
+    void (*run)(void);
+} XemuLibretroApi;
+
+static const XemuLibretroApi primary_api = {
+    retro_set_environment,
+    retro_set_video_refresh,
+    retro_set_audio_sample,
+    retro_set_audio_sample_batch,
+    retro_set_input_poll,
+    retro_set_input_state,
+    retro_init,
+    retro_deinit,
+    retro_get_system_av_info,
+    retro_set_controller_port_device,
+    retro_reset,
+    retro_load_game,
+    retro_unload_game,
+    retro_run,
+};
+
+/* Set in the modules that are not the primary one */
+static const XemuLibretroApi *primary;
+
+#define FORWARD_TO_PRIMARY(call) \
+    do {                         \
+        if (primary) {           \
+            primary->call;       \
+            return;              \
+        }                        \
+    } while (0)
+
+static void find_primary_module(void)
+{
+    /* Children of the frontend inherit the variable, hence the pid */
+    const char *value = g_getenv(PRIMARY_ENV_VAR);
+    int version, pid;
+    void *api;
+    if (value && sscanf(value, "%d:%d:%p", &version, &pid, &api) == 3 &&
+        version == PRIMARY_API_VERSION && pid == getpid()) {
+        primary = api;
+        return;
+    }
+
+    char *mine = g_strdup_printf("%d:%d:%p", PRIMARY_API_VERSION,
+                                 (int)getpid(), &primary_api);
+    g_setenv(PRIMARY_ENV_VAR, mine, TRUE);
+    g_free(mine);
+}
+
+/*
  * QEMU starts threads from constructors (RCU), and the machine outlives the
  * game, so the core must never be unmapped. This has to happen as the core
  * is loaded: frontends also load cores just to query them.
  */
 static void __attribute__((constructor)) pin_module(void)
 {
+    find_primary_module();
+
 #ifdef _WIN32
     HMODULE module;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -851,6 +927,7 @@ RETRO_API unsigned retro_api_version(void)
 
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
+    FORWARD_TO_PRIMARY(set_environment(cb));
     environ_cb = cb;
 
     bool no_game = true;
@@ -872,31 +949,37 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb)
 {
+    FORWARD_TO_PRIMARY(set_video_refresh(cb));
     video_cb = cb;
 }
 
 RETRO_API void retro_set_audio_sample(retro_audio_sample_t cb)
 {
+    FORWARD_TO_PRIMARY(set_audio_sample(cb));
     audio_cb = cb;
 }
 
 RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
 {
+    FORWARD_TO_PRIMARY(set_audio_sample_batch(cb));
     audio_batch_cb = cb;
 }
 
 RETRO_API void retro_set_input_poll(retro_input_poll_t cb)
 {
+    FORWARD_TO_PRIMARY(set_input_poll(cb));
     input_poll_cb = cb;
 }
 
 RETRO_API void retro_set_input_state(retro_input_state_t cb)
 {
+    FORWARD_TO_PRIMARY(set_input_state(cb));
     input_state_cb = cb;
 }
 
 RETRO_API void retro_init(void)
 {
+    FORWARD_TO_PRIMARY(init());
     retro_thread = g_thread_self();
 
     struct retro_log_callback log;
@@ -915,6 +998,7 @@ RETRO_API void retro_init(void)
 
 RETRO_API void retro_deinit(void)
 {
+    FORWARD_TO_PRIMARY(deinit());
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info)
@@ -940,6 +1024,7 @@ static void fill_geometry(struct retro_game_geometry *geom)
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
+    FORWARD_TO_PRIMARY(get_system_av_info(info));
     memset(info, 0, sizeof(*info));
     fill_geometry(&info->geometry);
     info->timing.fps = FRAME_RATE;
@@ -948,6 +1033,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 {
+    FORWARD_TO_PRIMARY(set_controller_port_device(port, device));
     if (port >= XEMU_LIBRETRO_NUM_PORTS) {
         return;
     }
@@ -962,6 +1048,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 
 RETRO_API void retro_reset(void)
 {
+    FORWARD_TO_PRIMARY(reset());
     g_mutex_lock(&state_lock);
     cmd_reset = true;
     g_mutex_unlock(&state_lock);
@@ -1018,8 +1105,18 @@ static void set_input_descriptors(void)
 
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
+    if (primary) {
+        return primary->load_game(game);
+    }
+
     const char *game_path = game ? game->path : NULL;
     retro_thread = g_thread_self();
+
+    if (game_loaded) {
+        /* Another instance of the frontend is using the machine */
+        show_message("xemu: only one Xbox can run at a time");
+        return false;
+    }
 
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) {
@@ -1094,6 +1191,7 @@ RETRO_API bool retro_load_game_special(unsigned type,
 
 RETRO_API void retro_unload_game(void)
 {
+    FORWARD_TO_PRIMARY(unload_game());
     if (!game_loaded) {
         return;
     }
@@ -1201,6 +1299,7 @@ static void poll_input(void)
 
 RETRO_API void retro_run(void)
 {
+    FORWARD_TO_PRIMARY(run());
     retro_thread = g_thread_self();
 
     bool updated = false;
