@@ -279,11 +279,23 @@ type_init(register_xemu_display);
 static void *qemu_thread_fn(void *opaque)
 {
     static char arg0[] = "xemu";
-    static char *argv[] = { arg0, NULL };
+    static char arg_trace[] = "-trace";
+    static char *argv[1 + 2 * 8 + 1] = { arg0 };
+    int argc = 1;
+
+    /* QEMU trace events, e.g. "usb_msd_*,usb_desc_*", go to stderr */
+    const char *trace = g_getenv("XEMU_LIBRETRO_TRACE");
+    char **patterns = g_strsplit(trace ?: "", ",", 8);
+    for (int i = 0; patterns[i]; i++) {
+        if (*patterns[i]) {
+            argv[argc++] = arg_trace;
+            argv[argc++] = patterns[i];
+        }
+    }
 
     /* Lets a profiler of the frontend tell the machine's threads apart */
     qemu_thread_naming(true);
-    qemu_init(1, argv);
+    qemu_init(argc, argv);
     qemu_main_loop();
     qatomic_set(&qemu_exiting, true);
     bql_unlock();

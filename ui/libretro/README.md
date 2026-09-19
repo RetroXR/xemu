@@ -115,4 +115,5 @@ again in the same process, so this is not a conventional core:
 Set `XEMU_LIBRETRO_LOG=<file>` to send the core's stdout/stderr (QEMU's own
 messages do not go through the frontend's log interface) to a file, and
 `XEMU_LIBRETRO_DEBUG=1` for periodic notes about the video path and the
-renderer's counters.
+renderer's counters. `XEMU_LIBRETRO_TRACE=<pattern>[,<pattern>...]` enables
+QEMU trace events, e.g. `usb_msd_*,usb_desc_*` to watch a memory unit.
