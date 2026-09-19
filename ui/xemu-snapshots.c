@@ -22,7 +22,9 @@
 #include "xemu-xbe.h"
 
 #include <SDL3/SDL.h>
+#ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
+#endif
 
 #include "block/aio.h"
 #include "block/block_int.h"
@@ -114,6 +116,7 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
     const size_t thumbnail_size = be32_to_cpu(*(uint32_t *)&buf[offset]);
     offset += 4;
 
+#ifdef CONFIG_OPENGL
     if (thumbnail_size) {
         GLuint thumbnail;
         glGenTextures(1, &thumbnail);
@@ -126,6 +129,7 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
         }
         offset += thumbnail_size;
     }
+#endif
 
     g_free(buf);
 }
@@ -142,9 +146,11 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
     if (*data) {
         for (int i = 0; i < xemu_snapshots_len; ++i) {
             g_free((*data)[i].xbe_title_name);
+#ifdef CONFIG_OPENGL
             if ((*data)[i].gl_thumbnail) {
                 glDeleteTextures(1, &((*data)[i].gl_thumbnail));
             }
+#endif
         }
         g_free(*data);
     }

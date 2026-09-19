@@ -257,6 +257,29 @@ case "$platform" in # Adjust compilation options based on platform
         postbuild='package_windows' # set the above function to be called after build
         target="qemu-system-i386w.exe"
         ;;
+    android)
+        # Only the libretro core: there is no SDL video or desktop GL to run
+        # the standalone UI on. ANDROID_DEPS is a prefix holding glib, pixman,
+        # slirp, samplerate, pcap and SDL3 built for the target.
+        echo "Cross-compiling for Android ($target_arch)..."
+        : "${ANDROID_NDK_ROOT:?ANDROID_NDK_ROOT is not set}"
+        : "${ANDROID_DEPS:?ANDROID_DEPS is not set}"
+        android_api="${ANDROID_API:-29}"
+        android_tc="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        export PATH="${android_tc}:${PATH}"
+        export PKG_CONFIG="${PKG_CONFIG:-pkg-config}"
+        export PKG_CONFIG_LIBDIR="${ANDROID_DEPS}/lib/pkgconfig"
+        sys_cflags='-fPIC -Wno-error'
+        sys_ldflags='-static-libstdc++'
+        libretro="y"
+        opts="$opts --cross-prefix=llvm- --host-cc=cc --cpu=aarch64
+              --cc=${android_tc}/aarch64-linux-android${android_api}-clang
+              --cxx=${android_tc}/aarch64-linux-android${android_api}-clang++
+              --disable-werror --disable-pie --disable-opengl --disable-gtk
+              --disable-tools --disable-guest-agent --disable-docs
+              --disable-libusb --disable-curl --disable-vnc --disable-plugins
+              -Db_staticpic=true"
+        ;;
     win64-cross)
         echo 'Cross-compiling for Windows...'
         export AR=${AR:-$CROSSAR}
@@ -276,6 +299,7 @@ if test ! -z "$libretro"; then
     opts="$opts --enable-libretro"
     case "$platform" in
         CYGWIN*|MINGW*|MSYS*|win64-cross) target="xemu_libretro.dll" ;;
+        android) target="xemu_libretro_android.so" ;;
         Darwin) target="xemu_libretro.dylib" ;;
         *) target="xemu_libretro.so" ;;
     esac

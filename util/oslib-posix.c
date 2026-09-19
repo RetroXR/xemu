@@ -984,6 +984,11 @@ void qemu_close_all_open_fd(const int *skip, unsigned int nskip)
 
 int qemu_shm_alloc(size_t size, Error **errp)
 {
+#ifdef __ANDROID__
+    /* bionic has no POSIX shared memory */
+    error_setg(errp, "POSIX shared memory is not available on Android");
+    return -1;
+#else
     g_autoptr(GString) shm_name = g_string_new(NULL);
     int fd, oflag, cur_sequence;
     static int sequence;
@@ -1032,4 +1037,5 @@ int qemu_shm_alloc(size_t size, Error **errp)
     }
 
     return fd;
+#endif
 }

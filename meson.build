@@ -68,6 +68,7 @@ foreach target : target_dirs
   have_system = have_system or target.endswith('-softmmu')
 endforeach
 have_user = have_linux_user or have_bsd_user
+have_libretro = have_system and get_option('libretro')
 
 ############
 # Programs #
@@ -80,6 +81,9 @@ cmake_macos_arch = host_machine.cpu() == 'aarch64' ? 'arm64' : host_machine.cpu(
 
 cc = meson.get_compiler('c')
 cxx = meson.get_compiler('cpp')
+
+# Android counts as Linux throughout, configure never says otherwise
+host_is_android = cc.get_define('__ANDROID__') != ''
 all_languages = ['c', 'cpp']
 if host_os == 'darwin' and \
    add_languages('objc', required: true, native: false)
@@ -1397,7 +1401,8 @@ rt = not_found
 if host_os != 'windows'
   have_shm_open = cc.has_function('shm_open')
   if not have_shm_open
-    rt = cc.find_library('rt', required: true)
+    # bionic has neither
+    rt = cc.find_library('rt', required: not host_is_android)
   endif
 endif
 
@@ -1462,7 +1467,8 @@ endif
 curl = dependency('libcurl', version: '>=7.29.0',
                   method: 'pkg-config',
                   required: false)
-if not curl.found()
+# Only the standalone UI (update check, compatibility reports) needs curl
+if not curl.found() and not have_libretro
   if host_os == 'windows'
     curl_platform_opts = ['schannel=enabled', 'sspi=enabled']
   elif host_os == 'darwin'
@@ -1882,10 +1888,11 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
                          required: get_option('coreaudio'))
 endif
 
-epoxy = dependency('epoxy', required: true)
+# The libretro core can do without GL, using the Vulkan renderer
+epoxy = dependency('epoxy', required: not get_option('opengl').disabled())
 
 opengl = not_found
-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
+if epoxy.found() and (not get_option('opengl').auto() or have_system or have_vhost_user_gpu)
   # FIXME: Use meson's 'gl' dep
   if host_os == 'darwin'
     opengl_libs=['-framework', 'OpenGL']
@@ -2389,6 +2396,9 @@ libglslang = not_found
 
 if host_os == 'windows'
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
+elif host_is_android
+  # Headers come with the NDK, and volk loads the library at run time
+  vulkan = declare_dependency()
 elif host_os == 'linux'
   vulkan = dependency('vulkan')
 endif
@@ -2398,7 +2408,8 @@ if vulkan.found()
   if not libglslang.found()
     # FIXME: Get spirv-tools to enable opt.
     glslang_opts = cmake.subproject_options()
-    glslang_opts.add_cmake_defines({'ENABLE_OPT': false, 'ENABLE_HLSL': false})
+    glslang_opts.add_cmake_defines({'ENABLE_OPT': false, 'ENABLE_HLSL': false,
+                                    'CMAKE_POSITION_INDEPENDENT_CODE': have_libretro})
     glslang_subpro = cmake.subproject('glslang', options: glslang_opts)
     libglslang = declare_dependency(link_with: [
           glslang_subpro.target('glslang'),
@@ -2410,9 +2421,14 @@ if vulkan.found()
   endif
 
   volk_opts = cmake.subproject_options()
-  volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
+  volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES',
+                               'CMAKE_POSITION_INDEPENDENT_CODE': have_libretro})
   if host_os == 'windows'
     volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
+  elif host_is_android
+    # The NDK has the headers in its sysroot. Left to itself CMake finds the
+    # build machine's, and drags /usr/include in with them.
+    volk_opts.add_cmake_defines({'VOLK_PULL_IN_VULKAN': 'OFF'})
   endif
   volk_subproj = cmake.subproject('volk', options: volk_opts)
   volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],
@@ -2421,7 +2437,8 @@ if vulkan.found()
                             dependencies: vulkan)
 
   spirv_reflect_opts = cmake.subproject_options()
-  spirv_reflect_opts.add_cmake_defines({'SPIRV_REFLECT_STATIC_LIB': 'ON'})
+  spirv_reflect_opts.add_cmake_defines({'SPIRV_REFLECT_STATIC_LIB': 'ON',
+                                        'CMAKE_POSITION_INDEPENDENT_CODE': have_libretro})
   spirv_reflect_subproj = cmake.subproject('SPIRV-Reflect', options: spirv_reflect_opts)
   spirv_reflect = declare_dependency(include_directories: spirv_reflect_subproj.include_directories('spirv-reflect-static'),
                                      link_with: spirv_reflect_subproj.target('spirv-reflect-static'),
@@ -2437,6 +2454,7 @@ endif
 
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
+if not have_libretro
 imgui_proj = subproject('imgui', required: true,
                          default_options: [
                            'default_library=static',
@@ -2462,6 +2480,7 @@ imgui = imgui_proj.get_variable('imgui_dep')
 implot_proj = subproject('implot', required: true,
                          default_options: ['default_library=static'])
 implot = implot_proj.get_variable('implot_dep')
+endif
 
 genconfig_proj = subproject('genconfig', required: true)
 genconfig = genconfig_proj.get_variable('cnode_dep')
@@ -2517,8 +2536,6 @@ config_host_data.set('CONFIG_AUDIO_DRIVERS',
 
 have_host_block_device = (host_os != 'darwin' or
     cc.has_header('IOKit/storage/IOMedia.h'))
-
-have_libretro = have_system and get_option('libretro')
 
 have_renderdoc = false
 if have_system and get_option('renderdoc').enabled()
@@ -4664,7 +4681,8 @@ foreach target : target_dirs
     endif
 
     if exe.get('libretro', false)
-      emulator = shared_module('xemu_libretro', exe['sources'],
+      emulator = shared_module('xemu_libretro' + (host_is_android ? '_android' : ''),
+                 exe['sources'],
                  name_prefix: '',
                  install: false,
                  c_args: c_args,

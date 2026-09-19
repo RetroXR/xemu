@@ -27,7 +27,11 @@ extern "C" {
 #endif
 
 #include "block/snapshot.h"
+#ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
+#else
+typedef unsigned int GLuint;
+#endif
 
 #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
 #define XEMU_SNAPSHOT_DATA_VERSION 1
