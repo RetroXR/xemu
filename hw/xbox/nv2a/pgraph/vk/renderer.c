@@ -190,18 +190,28 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
 
     surface->frame_time = pg->frame_time;
 
-#if HAVE_EXTERNAL_MEMORY
+    /* Have the renderer thread compose the display image */
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&pg->sync_pending, true);
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
+
+#if HAVE_EXTERNAL_MEMORY
     return r->display.gl_texture_id;
 #else
-    qemu_mutex_unlock(&d->pfifo.lock);
-    pgraph_vk_wait_for_surface_download(surface);
+    /* No texture to hand out, see get_framebuffer_pixels */
+    (void)r;
     return 0;
 #endif
+}
+
+static const uint8_t *pgraph_vk_get_framebuffer_pixels(NV2AState *d,
+                                                       int *width,
+                                                       int *height,
+                                                       int *stride)
+{
+    return pgraph_vk_get_display_pixels(&d->pgraph, width, height, stride);
 }
 
 static PGRAPHRenderer pgraph_vk_renderer = {
@@ -229,6 +239,7 @@ static PGRAPHRenderer pgraph_vk_renderer = {
         .set_surface_scale_factor = pgraph_vk_set_surface_scale_factor,
         .get_surface_scale_factor = pgraph_vk_get_surface_scale_factor,
         .get_framebuffer_surface = pgraph_vk_get_framebuffer_surface,
+        .get_framebuffer_pixels = pgraph_vk_get_framebuffer_pixels,
         .get_gpu_properties = pgraph_vk_get_gpu_properties,
     }
 };

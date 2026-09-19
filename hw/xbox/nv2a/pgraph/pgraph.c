@@ -284,6 +284,15 @@ void nv2a_context_init(void)
         if (!r) {
             continue;
         }
+#ifdef CONFIG_LIBRETRO
+        /*
+         * The renderer cannot be switched at run time, and the others may
+         * need a GL context that does not exist.
+         */
+        if (r->type != g_config.display.renderer) {
+            continue;
+        }
+#endif
         if (r->ops.early_context_init) {
             r->ops.early_context_init();
         }
@@ -369,6 +378,19 @@ int nv2a_get_framebuffer_surface(void)
     qemu_mutex_unlock(&pg->renderer_lock);
 
     return s;
+}
+
+const uint8_t *nv2a_get_framebuffer_pixels(int *width, int *height,
+                                           int *stride)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+
+    assert(pg->framebuffer_in_use);
+    if (!pg->renderer->ops.get_framebuffer_pixels) {
+        return NULL;
+    }
+    return pg->renderer->ops.get_framebuffer_pixels(d, width, height, stride);
 }
 
 void nv2a_release_framebuffer_surface(void)

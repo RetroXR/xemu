@@ -20,6 +20,16 @@
 #include "renderer.h"
 #include <math.h>
 
+/*
+ * GL imports the display image as RGBA8. When it is read back instead, BGRA
+ * saves the consumer a conversion to the usual XRGB8888.
+ */
+#if HAVE_EXTERNAL_MEMORY
+#define DISPLAY_IMAGE_FORMAT VK_FORMAT_R8G8B8A8_UNORM
+#else
+#define DISPLAY_IMAGE_FORMAT VK_FORMAT_B8G8R8A8_UNORM
+#endif
+
 static uint8_t *convert_texture_data__CR8YB8CB8YA8(uint8_t *data_out,
                                                    const uint8_t *data_in,
                                                    unsigned int width,
@@ -320,7 +330,7 @@ static void create_render_pass(PGRAPHState *pg)
 
     VkAttachmentReference color_reference;
     attachment = (VkAttachmentDescription){
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .format = DISPLAY_IMAGE_FORMAT,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -552,6 +562,11 @@ static void destroy_current_display_image(PGRAPHState *pg)
     CloseHandle(d->handle);
     d->handle = 0;
 #endif
+#else
+    vmaDestroyBuffer(r->allocator, d->readback_buffer, d->readback_allocation);
+    d->readback_buffer = VK_NULL_HANDLE;
+    d->readback_data = NULL;
+    d->readback_valid = false;
 #endif
 
     vkDestroyImageView(r->device, d->image_view, NULL);
@@ -578,10 +593,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         destroy_current_display_image(pg);
     }
 
-    const GLint gl_internal_format = GL_RGBA8;
     bool use_optimal_tiling = true;
 
 #if HAVE_EXTERNAL_MEMORY
+    const GLint gl_internal_format = GL_RGBA8;
     GLint num_tiling_types;
     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
@@ -609,7 +624,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .extent.depth = 1,
         .mipLevels = 1,
         .arrayLayers = 1,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .format = DISPLAY_IMAGE_FORMAT,
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -617,6 +632,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
 
+#if HAVE_EXTERNAL_MEMORY
     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
 #ifdef WIN32
@@ -626,6 +642,9 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
     };
     image_create_info.pNext = &external_memory_image_create_info;
+#else
+    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -641,6 +660,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
 
+#if HAVE_EXTERNAL_MEMORY
     VkExportMemoryAllocateInfo export_memory_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
         .handleTypes =
@@ -652,6 +672,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
             ,
     };
     alloc_info.pNext = &export_memory_alloc_info;
+#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -712,6 +733,26 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                          image_create_info.extent.width,
                          image_create_info.extent.height, d->gl_memory_obj, 0);
     assert(glGetError() == GL_NO_ERROR);
+
+#else
+
+    VkBufferCreateInfo buffer_create_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = (VkDeviceSize)width * height * 4,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VmaAllocationCreateInfo buffer_alloc_create_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+    };
+    VmaAllocationInfo buffer_alloc_info;
+    VK_CHECK(vmaCreateBuffer(r->allocator, &buffer_create_info,
+                             &buffer_alloc_create_info, &d->readback_buffer,
+                             &d->readback_allocation, &buffer_alloc_info));
+    d->readback_data = buffer_alloc_info.pMappedData;
+    d->readback_valid = false;
 
 #endif // HAVE_EXTERNAL_MEMORY
 
@@ -989,14 +1030,38 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
+#if HAVE_EXTERNAL_MEMORY
     pgraph_vk_transition_image_layout(pg, cmd, disp->image,
                                       VK_FORMAT_R8G8B8_UNORM,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+#else
+    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
+                                      VK_FORMAT_R8G8B8A8_UNORM,
+                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy readback_region = {
+        .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .imageSubresource.layerCount = 1,
+        .imageExtent.width = disp->width,
+        .imageExtent.height = disp->height,
+        .imageExtent.depth = 1,
+    };
+    vkCmdCopyImageToBuffer(cmd, disp->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           disp->readback_buffer, 1, &readback_region);
+#endif
 
     pgraph_vk_end_debug_marker(r, cmd);
     pgraph_vk_end_single_time_commands(pg, cmd);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
+
+#if !HAVE_EXTERNAL_MEMORY
+    /* The submission above is waited for, so the copy has completed */
+    vmaInvalidateAllocation(r->allocator, disp->readback_allocation, 0,
+                            VK_WHOLE_SIZE);
+    disp->readback_valid = true;
+#endif
 
     disp->draw_time = surface->draw_time;
 }
@@ -1057,6 +1122,26 @@ void pgraph_vk_finalize_display(PGRAPHState *pg)
     destroy_render_pass(pg);
     destroy_descriptor_set_layout(pg);
     destroy_descriptor_pool(pg);
+}
+
+const uint8_t *pgraph_vk_get_display_pixels(PGRAPHState *pg, int *width,
+                                            int *height, int *stride)
+{
+#if HAVE_EXTERNAL_MEMORY
+    return NULL;
+#else
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    PGRAPHVkDisplayState *disp = &r->display;
+
+    if (!disp->readback_valid) {
+        return NULL;
+    }
+
+    *width = disp->width;
+    *height = disp->height;
+    *stride = disp->width * 4;
+    return disp->readback_data;
+#endif
 }
 
 void pgraph_vk_render_display(PGRAPHState *pg)

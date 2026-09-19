@@ -41,7 +41,15 @@
 #include "constants.h"
 #include "glsl.h"
 
+/*
+ * The display image is handed to the frontend as a GL texture through the
+ * external memory extensions. Without a GL frontend it is read back instead.
+ */
+#if defined(CONFIG_OPENGL) && !defined(CONFIG_LIBRETRO)
 #define HAVE_EXTERNAL_MEMORY 1
+#else
+#define HAVE_EXTERNAL_MEMORY 0
+#endif
 
 typedef struct QueueFamilyIndices {
     int queue_family;
@@ -286,6 +294,7 @@ typedef struct PGRAPHVkDisplayState {
     int width, height;
     int draw_time;
 
+#if HAVE_EXTERNAL_MEMORY
     // OpenGL Interop
 #ifdef WIN32
     HANDLE handle;
@@ -294,6 +303,13 @@ typedef struct PGRAPHVkDisplayState {
 #endif
     GLuint gl_memory_obj;
     GLuint gl_texture_id;
+#else
+    // Readback
+    VkBuffer readback_buffer;
+    VmaAllocation readback_allocation;
+    uint8_t *readback_data;
+    bool readback_valid;
+#endif
 } PGRAPHVkDisplayState;
 
 typedef struct ComputePipelineKey {
@@ -541,6 +557,8 @@ void pgraph_vk_unpack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
 void pgraph_vk_init_display(PGRAPHState *pg);
 void pgraph_vk_finalize_display(PGRAPHState *pg);
 void pgraph_vk_render_display(PGRAPHState *pg);
+const uint8_t *pgraph_vk_get_display_pixels(PGRAPHState *pg, int *width,
+                                            int *height, int *stride);
 
 // texture.c
 void pgraph_vk_init_textures(PGRAPHState *pg);

@@ -32,12 +32,14 @@ static char const *const validation_layers[] = {
 };
 
 static char const *const required_device_extensions[] = {
+#if HAVE_EXTERNAL_MEMORY
 #ifdef WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+#endif
 #endif
 };
 
