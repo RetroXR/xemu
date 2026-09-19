@@ -184,6 +184,10 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
     SurfaceBinding *surface = pgraph_vk_surface_get_within(
         d, d->pcrtc.start + vga_display_params.line_offset);
     if (surface == NULL || !surface->color) {
+#if !HAVE_EXTERNAL_MEMORY
+        /* The guest draws with the CPU now, the last readback is stale */
+        r->display.readback_valid = false;
+#endif
         qemu_mutex_unlock(&d->pfifo.lock);
         return 0;
     }
