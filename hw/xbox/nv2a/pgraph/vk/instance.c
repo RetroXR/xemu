@@ -333,6 +333,12 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+    r->demote_to_helper_invocation_enabled =
+        r->vk_api_version >= VK_API_VERSION_1_3 ||
+        add_extension_if_available(
+            available_extensions, enabled_extension_names,
+            VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME);
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -519,6 +525,23 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
     }
 
     void *next_struct = NULL;
+
+    /*
+     * Shaders are compiled for SPIR-V 1.6, where glslang turns discard into
+     * OpDemoteToHelperInvocation. That is a feature which has to be enabled,
+     * core as of Vulkan 1.3 and an extension before.
+     */
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures demote_features;
+    if (r->demote_to_helper_invocation_enabled) {
+        demote_features =
+            (VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures){
+                .sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+                .shaderDemoteToHelperInvocation = VK_TRUE,
+                .pNext = next_struct,
+            };
+        next_struct = &demote_features;
+    }
 
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_features;
     if (r->custom_border_color_extension_enabled) {

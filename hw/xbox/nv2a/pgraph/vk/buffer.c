@@ -50,10 +50,16 @@ void pgraph_vk_init_buffers(NV2AState *d)
 
     // FIXME: Profile buffer sizes
 
+    /*
+     * Mapped buffers are written and read without flushing or invalidating
+     * in most places. Unified memory GPUs offer host visible memory that is
+     * cached but not coherent, which VMA would pick for random access.
+     */
     VmaAllocationCreateInfo host_alloc_create_info = {
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                  VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+        .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
     };
     VmaAllocationCreateInfo device_alloc_create_info = {
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -74,7 +80,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
 
     r->storage_buffers[BUFFER_COMPUTE_DST] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .buffer_size = (1024 * 10) * (1024 * 10) * 8,
     };
@@ -82,6 +89,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
     r->storage_buffers[BUFFER_COMPUTE_SRC] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .buffer_size = r->storage_buffers[BUFFER_COMPUTE_DST].buffer_size,
     };
