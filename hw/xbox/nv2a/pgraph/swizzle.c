@@ -82,6 +82,33 @@ static inline void swizzle_box_internal(
     uint32_t mask_x, mask_y, mask_z;
     generate_swizzle_masks(width, height, depth, &mask_x, &mask_y, &mask_z);
 
+    if (depth == 1 && width >= 2 && height >= 2) {
+        /*
+         * The lowest bits of a 2D "Z" offset are the lowest bits of x and y,
+         * so a 2x2 block of pixels is four consecutive swizzled ones. Moving
+         * two pixels of a row at a time halves the offset arithmetic, which
+         * is most of the work.
+         */
+        unsigned int off_y = 0;
+        for (unsigned int y = 0; y < height; y += 2) {
+            const uint8_t *src_row0 = src_buf + y * row_pitch;
+            const uint8_t *src_row1 = src_row0 + row_pitch;
+            unsigned int off_x = 0;
+            for (unsigned int x = 0; x < width; x += 2) {
+                uint8_t *dst = dst_buf + (off_y + off_x) * bytes_per_pixel;
+                memcpy(dst, src_row0 + x * bytes_per_pixel,
+                       2 * bytes_per_pixel);
+                memcpy(dst + 2 * bytes_per_pixel,
+                       src_row1 + x * bytes_per_pixel, 2 * bytes_per_pixel);
+                off_x = (off_x - mask_x) & mask_x;
+                off_x = (off_x - mask_x) & mask_x;
+            }
+            off_y = (off_y - mask_y) & mask_y;
+            off_y = (off_y - mask_y) & mask_y;
+        }
+        return;
+    }
+
     /*
      * Map linear texture to swizzled texture using swizzle masks.
      * https://fgiesen.wordpress.com/2011/01/17/texture-tiling-and-swizzling/
@@ -127,6 +154,29 @@ static inline void unswizzle_box_internal(
 {
     uint32_t mask_x, mask_y, mask_z;
     generate_swizzle_masks(width, height, depth, &mask_x, &mask_y, &mask_z);
+
+    if (depth == 1 && width >= 2 && height >= 2) {
+        /* 2x2 blocks, see swizzle_box_internal() */
+        unsigned int off_y = 0;
+        for (unsigned int y = 0; y < height; y += 2) {
+            uint8_t *dst_row0 = dst_buf + y * row_pitch;
+            uint8_t *dst_row1 = dst_row0 + row_pitch;
+            unsigned int off_x = 0;
+            for (unsigned int x = 0; x < width; x += 2) {
+                const uint8_t *src =
+                    src_buf + (off_y + off_x) * bytes_per_pixel;
+                memcpy(dst_row0 + x * bytes_per_pixel, src,
+                       2 * bytes_per_pixel);
+                memcpy(dst_row1 + x * bytes_per_pixel,
+                       src + 2 * bytes_per_pixel, 2 * bytes_per_pixel);
+                off_x = (off_x - mask_x) & mask_x;
+                off_x = (off_x - mask_x) & mask_x;
+            }
+            off_y = (off_y - mask_y) & mask_y;
+            off_y = (off_y - mask_y) & mask_y;
+        }
+        return;
+    }
 
     int x, y, z;
     int off_z = 0;
