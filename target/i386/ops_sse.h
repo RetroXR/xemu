@@ -511,6 +511,96 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
 
 #endif
 
+#ifdef XBOX
+/*
+ * The Xbox has single precision SSE only, and games use it with the MXCSR the
+ * way it comes, rounding to nearest with exceptions masked, or with flush to
+ * zero added. The host's single precision arithmetic gives the results of
+ * softfloat then, bit for bit, as long as no NaN is involved, which x86
+ * propagates in its own way, and the result is not a denormal, which may have
+ * to be flushed. What is lost are the status flags of the MXCSR. Anything
+ * else goes to softfloat.
+ */
+#ifndef XBOX_SSE_HARD_FLOAT
+#define XBOX_SSE_HARD_FLOAT
+
+#define XBOX_MXCSR_HARD_MASK  0x7fc0 /* RC, exception masks, DAZ */
+#define XBOX_MXCSR_HARD_VALUE 0x1f80 /* all masked, the rest clear */
+
+static inline bool xbox_sse_hard_float(CPUX86State *env)
+{
+    return (env->mxcsr & XBOX_MXCSR_HARD_MASK) == XBOX_MXCSR_HARD_VALUE;
+}
+
+typedef union {
+    float32 bits;
+    float f;
+} XboxF32;
+
+#define XBOX_F32_ARITH(name, op)                                        \
+static inline float32 xbox_f32_##name(CPUX86State *env, float32 a,      \
+                                      float32 b)                        \
+{                                                                       \
+    if (likely(xbox_sse_hard_float(env))) {                             \
+        XboxF32 x = { .bits = a }, y = { .bits = b }, r;                \
+        r.f = x.f op y.f;                                               \
+        /* Neither a NaN nor a denormal; a zero has no fraction */      \
+        if (likely(r.f == r.f &&                                        \
+                   ((r.bits & 0x7f800000) || !(r.bits & 0x007fffff)))) {\
+            return r.bits;                                              \
+        }                                                               \
+    }                                                                   \
+    return float32_##name(a, b, &env->sse_status);                      \
+}
+
+XBOX_F32_ARITH(add, +)
+XBOX_F32_ARITH(sub, -)
+XBOX_F32_ARITH(mul, *)
+XBOX_F32_ARITH(div, /)
+
+/* a < b, which is false for a NaN like float32_lt() */
+static inline bool xbox_f32_lt(CPUX86State *env, float32 a, float32 b)
+{
+    if (likely(xbox_sse_hard_float(env))) {
+        XboxF32 x = { .bits = a }, y = { .bits = b };
+        return x.f < y.f;
+    }
+    return float32_lt(a, b, &env->sse_status);
+}
+
+static inline FloatRelation xbox_f32_compare(CPUX86State *env, float32 a,
+                                             float32 b, bool quiet)
+{
+    if (likely(xbox_sse_hard_float(env))) {
+        XboxF32 x = { .bits = a }, y = { .bits = b };
+        if (x.f < y.f) {
+            return float_relation_less;
+        } else if (x.f > y.f) {
+            return float_relation_greater;
+        } else if (x.f == y.f) {
+            return float_relation_equal;
+        }
+        return float_relation_unordered;
+    }
+    return quiet ? float32_compare_quiet(a, b, &env->sse_status) :
+                   float32_compare(a, b, &env->sse_status);
+}
+
+#define xbox_f64_add(env, a, b) float64_add(a, b, &(env)->sse_status)
+#define xbox_f64_sub(env, a, b) float64_sub(a, b, &(env)->sse_status)
+#define xbox_f64_mul(env, a, b) float64_mul(a, b, &(env)->sse_status)
+#define xbox_f64_div(env, a, b) float64_div(a, b, &(env)->sse_status)
+#define xbox_f64_lt(env, a, b) float64_lt(a, b, &(env)->sse_status)
+
+#endif /* XBOX_SSE_HARD_FLOAT */
+
+#define FPU_ADD(size, a, b) xbox_f ## size ## _add(env, a, b)
+#define FPU_SUB(size, a, b) xbox_f ## size ## _sub(env, a, b)
+#define FPU_MUL(size, a, b) xbox_f ## size ## _mul(env, a, b)
+#define FPU_DIV(size, a, b) xbox_f ## size ## _div(env, a, b)
+#define FPU_MIN(size, a, b) (xbox_f ## size ## _lt(env, a, b) ? (a) : (b))
+#define FPU_MAX(size, a, b) (xbox_f ## size ## _lt(env, b, a) ? (a) : (b))
+#else
 #define FPU_ADD(size, a, b) float ## size ## _add(a, b, &env->sse_status)
 #define FPU_SUB(size, a, b) float ## size ## _sub(a, b, &env->sse_status)
 #define FPU_MUL(size, a, b) float ## size ## _mul(a, b, &env->sse_status)
@@ -524,6 +614,7 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
     (float ## size ## _lt(a, b, &env->sse_status) ? (a) : (b))
 #define FPU_MAX(size, a, b)                                     \
     (float ## size ## _lt(b, a, &env->sse_status) ? (a) : (b))
+#endif
 
 SSE_HELPER_S(add, FPU_ADD)
 SSE_HELPER_S(sub, FPU_SUB)
@@ -1109,7 +1200,11 @@ void helper_ucomiss(CPUX86State *env, Reg *d, Reg *s)
 
     s0 = d->ZMM_S(0);
     s1 = s->ZMM_S(0);
+#ifdef XBOX
+    ret = xbox_f32_compare(env, s0, s1, true);
+#else
     ret = float32_compare_quiet(s0, s1, &env->sse_status);
+#endif
     CC_SRC = comis_eflags[ret + 1];
     CC_OP = CC_OP_EFLAGS;
 }
@@ -1121,7 +1216,11 @@ void helper_comiss(CPUX86State *env, Reg *d, Reg *s)
 
     s0 = d->ZMM_S(0);
     s1 = s->ZMM_S(0);
+#ifdef XBOX
+    ret = xbox_f32_compare(env, s0, s1, false);
+#else
     ret = float32_compare(s0, s1, &env->sse_status);
+#endif
     CC_SRC = comis_eflags[ret + 1];
     CC_OP = CC_OP_EFLAGS;
 }
