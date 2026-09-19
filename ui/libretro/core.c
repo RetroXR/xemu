@@ -86,6 +86,7 @@ static FrameState frame_state;
 static bool frame_valid;
 static XemuLibretroFrame frame;
 static bool cmd_reset, cmd_pause, cmd_resume, cmd_eject, cmd_sync_ports;
+static unsigned cmds_posted, cmds_done;
 static char *cmd_load_disc;
 static int cmd_scale;
 
@@ -298,6 +299,7 @@ static void process_commands(void)
     cmd_reset = cmd_pause = cmd_resume = cmd_eject = cmd_sync_ports = false;
     cmd_load_disc = NULL;
     cmd_scale = 0;
+    unsigned posted = cmds_posted;
     g_mutex_unlock(&state_lock);
 
     if (!reset && !pause && !resume && !eject && !sync_ports && !disc_path &&
@@ -339,6 +341,11 @@ static void process_commands(void)
     }
 
     xemu_main_loop_unlock();
+
+    g_mutex_lock(&state_lock);
+    cmds_done = posted;
+    g_cond_broadcast(&state_cond);
+    g_mutex_unlock(&state_lock);
 }
 
 static void *core_thread_fn(void *opaque)
@@ -953,11 +960,25 @@ RETRO_API void retro_unload_game(void)
     }
     game_loaded = false;
 
-    /* Park the machine. Stopping it also flushes the disk images. */
+    /*
+     * Park the machine. Stopping it also flushes the disk images, so wait
+     * for that: the frontend is free to exit the process right after this.
+     */
     g_mutex_lock(&state_lock);
     cmd_pause = true;
     cmd_resume = false;
     cmd_eject = true;
+    unsigned ticket = ++cmds_posted;
+    g_cond_broadcast(&state_cond);
+
+    int64_t deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (core_state == CORE_RUNNING && (int)(cmds_done - ticket) < 0) {
+        if (!g_cond_wait_until(&state_cond, &state_lock, deadline)) {
+            xemu_libretro_log(RETRO_LOG_WARN,
+                              "Timed out waiting for the machine to stop\n");
+            break;
+        }
+    }
     g_mutex_unlock(&state_lock);
 }
 
