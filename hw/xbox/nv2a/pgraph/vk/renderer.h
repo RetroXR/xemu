@@ -475,6 +475,7 @@ uint32_t pgraph_vk_get_memory_type(PGRAPHState *pg, uint32_t type_bits,
 // glsl.c
 void pgraph_vk_init_glsl_compiler(void);
 void pgraph_vk_finalize_glsl_compiler(void);
+void pgraph_vk_glsl_set_preserve_nan_inf(bool enable);
 GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                                           const char *glsl_source);
 VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r,
@@ -557,6 +558,9 @@ void pgraph_vk_unpack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
 // display.c
 void pgraph_vk_init_display(PGRAPHState *pg);
 void pgraph_vk_finalize_display(PGRAPHState *pg);
+// layer-shim.c
+bool pgraph_vk_init_layer_shim(void);
+
 void pgraph_vk_render_display(PGRAPHState *pg);
 const uint8_t *pgraph_vk_get_display_pixels(PGRAPHState *pg, int *width,
                                             int *height, int *stride);

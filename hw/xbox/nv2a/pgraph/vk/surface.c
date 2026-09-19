@@ -821,9 +821,35 @@ static void create_surface_image(PGRAPHState *pg, SurfaceBinding *surface)
     VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_RED, __func__);
 
+    /*
+     * Render passes load the attachments, so give them defined contents.
+     * Fresh memory happens to be zeroed on desktop GPUs. It is not on tile
+     * based ones, where whatever is not drawn over shows up as garbage.
+     */
     pgraph_vk_transition_image_layout(
         pg, cmd, surface->image, surface->host_fmt.vk_format,
-        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageSubresourceRange clear_range = {
+        .aspectMask = surface->host_fmt.aspect,
+        .levelCount = 1,
+        .layerCount = 1,
+    };
+    if (surface->color) {
+        VkClearColorValue clear_color = { 0 };
+        vkCmdClearColorImage(cmd, surface->image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             &clear_color, 1, &clear_range);
+    } else {
+        VkClearDepthStencilValue clear_zeta = { 0 };
+        vkCmdClearDepthStencilImage(cmd, surface->image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    &clear_zeta, 1, &clear_range);
+    }
+
+    pgraph_vk_transition_image_layout(
+        pg, cmd, surface->image, surface->host_fmt.vk_format,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         surface->color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 

@@ -764,6 +764,19 @@ static void create_pipeline(PGRAPHState *pg)
             .pName = "main",
         };
 
+    if (getenv("XEMU_VK_DEBUG_VERTEX")) {
+        fprintf(stderr, "pipeline: topology=%d geom=%d attrs:",
+                get_primitive_topology(pg),
+                r->shader_binding->geom.module_info != NULL);
+        for (int i = 0; i < r->num_active_vertex_attribute_descriptions; i++) {
+            fprintf(stderr, " loc%d=fmt%d/stride%d",
+                    r->vertex_attribute_descriptions[i].location,
+                    r->vertex_attribute_descriptions[i].format,
+                    r->vertex_binding_descriptions[i].stride);
+        }
+        fputc(10, stderr);
+    }
+
     VkPipelineVertexInputStateCreateInfo vertex_input = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount =
@@ -1626,8 +1639,14 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
 
         NV2A_VK_DPRINTF("- %d: %08"HWADDR_PRIx" %zd bytes", i, addr, size);
 
+        static int ignore_dirty = -1;
+        if (ignore_dirty < 0) {
+            ignore_dirty = getenv("XEMU_VK_IGNORE_DIRTY") != NULL;
+        }
+
         if (memory_region_test_and_clear_dirty(d->vram, addr, size,
-                                               DIRTY_MEMORY_NV2A)) {
+                                               DIRTY_MEMORY_NV2A) ||
+            ignore_dirty) {
             NV2A_VK_DPRINTF("Memory dirty. Synchronizing...");
             pgraph_vk_update_vertex_ram_buffer(pg, addr, d->vram_ptr + addr,
                                                size);
@@ -1933,7 +1952,12 @@ static VertexBufferRemap remap_unaligned_attributes(PGRAPHState *pg,
             (r->vertex_attribute_offsets[attr_id] % element_size == 0);
         bool stride_valid = (desc->stride % element_size == 0);
 
-        if (offset_valid && stride_valid) {
+        static int force_remap = -1;
+        if (force_remap < 0) {
+            force_remap = getenv("XEMU_VK_REMAP_ALL") != NULL;
+        }
+
+        if (offset_valid && stride_valid && !force_remap) {
             continue;
         }
 
@@ -2018,6 +2042,26 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
     buffer->buffer_offset += remap.buffer_space_required;
 }
 
+/* Debugging aid: XEMU_VK_SKIP_GS drops every draw with a geometry shader */
+static bool debug_skip_draw(PGRAPHVkState *r)
+{
+    static int skip_gs = -1;
+    if (skip_gs < 0) {
+        skip_gs = getenv("XEMU_VK_SKIP_GS") != NULL;
+    }
+    static int skip_topology = -2;
+    if (skip_topology == -2) {
+        const char *v = getenv("XEMU_VK_SKIP_TOPOLOGY");
+        skip_topology = v ? atoi(v) : -1;
+    }
+    if (skip_topology >= 0 &&
+        r->shader_binding->state.geom.primitive_mode == skip_topology) {
+        return true;
+    }
+
+    return skip_gs && r->shader_binding->geom.module_info;
+}
+
 void pgraph_vk_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -2060,7 +2104,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
             uint32_t start = pg->draw_arrays_start[i],
                      count = pg->draw_arrays_count[i];
             NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            if (!debug_skip_draw(r)) vkCmdDraw(r->command_buffer, count, 1, start, 0);
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2101,7 +2145,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              buffer_offset, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
+        if (!debug_skip_draw(r)) vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
                          0);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2139,7 +2183,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Buffer");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        if (!debug_skip_draw(r)) vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2183,7 +2227,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Array");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        if (!debug_skip_draw(r)) vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
         NV2A_VK_DGROUP_END();

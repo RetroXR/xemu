@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/units.h"
 #include "renderer.h"
 
 static void create_buffer(PGRAPHState *pg, StorageBuffer *buffer)
@@ -32,6 +33,16 @@ static void create_buffer(PGRAPHState *pg, StorageBuffer *buffer)
     VK_CHECK(vmaCreateBuffer(r->allocator, &buffer_create_info,
                              &buffer->alloc_info, &buffer->buffer,
                              &buffer->allocation, NULL));
+
+    if (getenv("XEMU_VK_DEBUG_BUFFERS")) {
+        VmaAllocationInfo info;
+        vmaGetAllocationInfo(r->allocator, buffer->allocation, &info);
+        VkMemoryPropertyFlags flags;
+        vmaGetMemoryTypeProperties(r->allocator, info.memoryType, &flags);
+        fprintf(stderr, "buffer: size=%zu usage=%x memtype=%u flags=%x\n",
+                (size_t)buffer->buffer_size, buffer->usage, info.memoryType,
+                flags);
+    }
 }
 
 static void destroy_buffer(PGRAPHState *pg, StorageBuffer *buffer)
@@ -144,6 +155,35 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .buffer_size = r->storage_buffers[BUFFER_UNIFORM].buffer_size,
     };
+
+    /*
+     * The scratch buffers above are sized for the worst case at a high
+     * resolution scale, and come to several GiB. A discrete GPU does not
+     * mind. An integrated one takes them out of system memory, and the
+     * Adreno driver hands out allocations beyond maxMemoryAllocationSize
+     * without complaint, only to then read garbage from them. Everything
+     * that fills these buffers flushes when they run out of space, so
+     * smaller ones cost submissions, not correctness.
+     */
+    VkPhysicalDeviceMaintenance3Properties maintenance3 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 properties2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &maintenance3,
+    };
+    vkGetPhysicalDeviceProperties2(r->physical_device, &properties2);
+
+    VkDeviceSize max_buffer_size = maintenance3.maxMemoryAllocationSize;
+    if (r->device_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        max_buffer_size = MIN(max_buffer_size, 128 * MiB);
+    }
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (i != BUFFER_VERTEX_RAM) {
+            r->storage_buffers[i].buffer_size =
+                MIN(r->storage_buffers[i].buffer_size, max_buffer_size);
+        }
+    }
 
     for (int i = 0; i < BUFFER_COUNT; i++) {
         create_buffer(pg, &r->storage_buffers[i]);

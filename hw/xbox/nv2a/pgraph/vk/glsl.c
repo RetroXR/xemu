@@ -140,9 +140,104 @@ void pgraph_vk_finalize_glsl_compiler(void)
     glslang_finalize_process();
 }
 
+static bool preserve_nan_inf;
+
+void pgraph_vk_glsl_set_preserve_nan_inf(bool enable)
+{
+    preserve_nan_inf = enable;
+}
+
+/*
+ * The generated shaders emulate NV2A arithmetic on top of IEEE infinities
+ * and NaNs (isnan(), 1.0 / 0.0, 0 * inf), which is only safe where the
+ * compiler may not assume that they never occur. Desktop drivers do not;
+ * mobile ones do, unless the entry point has the SignedZeroInfNanPreserve
+ * execution mode. GLSL cannot express that, so add it to the module:
+ *
+ *   OpCapability SignedZeroInfNanPreserve
+ *   OpExecutionMode %main SignedZeroInfNanPreserve 32
+ *
+ * Both are core as of SPIR-V 1.4.
+ */
+static void add_nan_inf_preserve_execution_mode(GByteArray *spv)
+{
+    enum {
+        OpExtension = 10,
+        OpExtInstImport = 11,
+        OpMemoryModel = 14,
+        OpEntryPoint = 15,
+        OpExecutionMode = 16,
+        OpCapability = 17,
+        OpExecutionModeId = 331,
+        CapabilitySignedZeroInfNanPreserve = 4466,
+        ExecutionModeSignedZeroInfNanPreserve = 4461,
+    };
+
+    const uint32_t *words = (const uint32_t *)spv->data;
+    size_t num_words = spv->len / sizeof(uint32_t);
+    size_t capabilities_end = 5, modes_end = 0;
+    uint32_t entry_points[8];
+    int num_entry_points = 0;
+
+    for (size_t i = 5; i < num_words;) {
+        uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
+        if (count == 0 || i + count > num_words) {
+            return;
+        }
+
+        if (op == OpCapability) {
+            capabilities_end = i + count;
+        } else if (op == OpEntryPoint) {
+            if (num_entry_points < ARRAY_SIZE(entry_points)) {
+                entry_points[num_entry_points++] = words[i + 2];
+            }
+            modes_end = i + count;
+        } else if (op == OpExecutionMode || op == OpExecutionModeId) {
+            modes_end = i + count;
+        } else if (op != OpExtension && op != OpExtInstImport &&
+                   op != OpMemoryModel) {
+            break;
+        }
+        i += count;
+    }
+
+    if (!modes_end || !num_entry_points) {
+        return;
+    }
+
+    /* Back to front, so that the first position stays valid */
+    for (int i = 0; i < num_entry_points; i++) {
+        uint32_t mode[] = { (4 << 16) | OpExecutionMode, entry_points[i],
+                            ExecutionModeSignedZeroInfNanPreserve, 32 };
+        g_byte_array_set_size(spv, spv->len + sizeof(mode));
+        uint8_t *at = spv->data + modes_end * sizeof(uint32_t);
+        memmove(at + sizeof(mode), at,
+                spv->len - sizeof(mode) - modes_end * sizeof(uint32_t));
+        memcpy(at, mode, sizeof(mode));
+    }
+
+    uint32_t capability[] = { (2 << 16) | OpCapability,
+                              CapabilitySignedZeroInfNanPreserve };
+    g_byte_array_set_size(spv, spv->len + sizeof(capability));
+    uint8_t *at = spv->data + capabilities_end * sizeof(uint32_t);
+    memmove(at + sizeof(capability), at,
+            spv->len - sizeof(capability) -
+                capabilities_end * sizeof(uint32_t));
+    memcpy(at, capability, sizeof(capability));
+}
+
 GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                                           const char *glsl_source)
 {
+    /* Debugging aid: XEMU_VK_DUMP_SHADERS=<dir> keeps every source */
+    const char *dump_dir = getenv("XEMU_VK_DUMP_SHADERS");
+    if (dump_dir) {
+        static int dump_count;
+        g_autofree char *path = g_strdup_printf("%s/shader-%03d-stage%d.glsl",
+                                                dump_dir, dump_count++, stage);
+        g_file_set_contents(path, glsl_source, -1, NULL);
+    }
+
     const glslang_input_t input = {
         .language = GLSLANG_SOURCE_GLSL,
         .stage = stage,
@@ -239,7 +334,11 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     glslang_program_delete(program);
     glslang_shader_delete(shader);
 
-    return g_byte_array_new_take(data, num_program_bytes);
+    GByteArray *spv = g_byte_array_new_take(data, num_program_bytes);
+    if (preserve_nan_inf) {
+        add_nan_inf_preserve_execution_mode(spv);
+    }
+    return spv;
 }
 
 VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r, GByteArray *spv)

@@ -606,6 +606,23 @@ static void add_final_stage_code(struct PixelShader *ps, struct FCInputInfo fina
                        mstring_get_str(b), mstring_get_str(a));
     mstring_append_fmt(ps->code, "fragColor.a = %s;\n", mstring_get_str(g));
 
+    /* Debugging aid: show geometry only, shaded by screen position */
+    if (getenv("XEMU_GLSL_DEBUG_FS")) {
+        static const char *outputs[] = {
+            "vec4(fract(gl_FragCoord.xy / 64.0), 0.5, 1.0)", /* 0: coverage */
+            "vec4(pD0.rgb, 1.0)", /* 1: diffuse varying */
+            "vec4(fract(pT0.xy), 0.5, 1.0)", /* 2: texcoord 0 */
+            "vec4(t0.rgb, 1.0)", /* 3: texture stage 0 */
+            "vec4(t1.rgb, 1.0)", /* 4 */
+            "vec4(t2.rgb, 1.0)", /* 5 */
+            "vec4(t3.rgb, 1.0)", /* 6 */
+            "vec4(fragColor.rgb, 1.0)", /* 7: combiner result, no blend */
+        };
+        int which = atoi(getenv("XEMU_GLSL_DEBUG_FS"));
+        which = MIN(MAX(which, 0), (int)ARRAY_SIZE(outputs) - 1);
+        mstring_append_fmt(ps->code, "fragColor = %s;\n", outputs[which]);
+    }
+
     mstring_unref(a);
     mstring_unref(b);
     mstring_unref(c);
@@ -1498,7 +1515,10 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
-    switch (ps->state->depth_format) {
+    /* Debugging aid: leave depth to the rasterizer */
+    switch (getenv("XEMU_GLSL_NO_FRAGDEPTH") ? -1 : ps->state->depth_format) {
+    case -1:
+        break;
     case DEPTH_FORMAT_D16:
         // 16-bit unsigned int
         mstring_append(

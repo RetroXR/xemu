@@ -141,7 +141,8 @@ add_optional_instance_extension_names(PGRAPHState *pg,
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     r->debug_utils_extension_enabled =
-        g_config.display.vulkan.validation_layers &&
+        (g_config.display.vulkan.validation_layers ||
+         g_getenv("XEMU_VK_LAYER_PATH")) &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 }
@@ -151,10 +152,13 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
-    result = volkInitialize();
-    if (result != VK_SUCCESS) {
-        error_setg(errp, "volkInitialize failed");
-        return false;
+    bool layer_shim = pgraph_vk_init_layer_shim();
+    if (!layer_shim) {
+        result = volkInitialize();
+        if (result != VK_SUCCESS) {
+            error_setg(errp, "volkInitialize failed");
+            return false;
+        }
     }
 
     uint32_t instance_version = VK_API_VERSION_1_0;
@@ -215,6 +219,12 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
         .enabledValidationFeatureCount = ARRAY_SIZE(enables),
         .pEnabledValidationFeatures = enables,
     };
+
+    if (layer_shim) {
+        /* Already in the chain, and unknown to the loader by name */
+        enable_validation = false;
+        create_info.pNext = &validationFeatures;
+    }
 
     if (enable_validation) {
         if (check_validation_layer_support()) {
@@ -327,6 +337,7 @@ static void add_optional_device_extension_names(
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     r->custom_border_color_extension_enabled =
+        !getenv("XEMU_VK_NO_CUSTOM_BORDER_COLOR") &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
 
@@ -430,6 +441,21 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
     xemu_settings_set_string(&g_config.display.vulkan.preferred_physical_device,
                              r->device_props.deviceName);
     r->vk_api_version = MIN(r->vk_api_version, r->device_props.apiVersion);
+
+    /* See add_nan_inf_preserve_execution_mode() */
+    bool preserve_nan_inf = false;
+    if (r->vk_api_version >= VK_API_VERSION_1_2) {
+        VkPhysicalDeviceFloatControlsProperties float_controls = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES,
+        };
+        VkPhysicalDeviceProperties2 properties2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &float_controls,
+        };
+        vkGetPhysicalDeviceProperties2(r->physical_device, &properties2);
+        preserve_nan_inf = float_controls.shaderSignedZeroInfNanPreserveFloat32;
+    }
+    pgraph_vk_glsl_set_preserve_nan_inf(preserve_nan_inf);
 
     fprintf(stderr,
             "Selected physical device: %s\n"

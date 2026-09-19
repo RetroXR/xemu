@@ -269,7 +269,7 @@ case "$platform" in # Adjust compilation options based on platform
         export PATH="${android_tc}:${PATH}"
         export PKG_CONFIG="${PKG_CONFIG:-pkg-config}"
         export PKG_CONFIG_LIBDIR="${ANDROID_DEPS}/lib/pkgconfig"
-        sys_cflags='-fPIC -Wno-error'
+        sys_cflags='-fPIC -fsigned-char -Wno-error'
         sys_ldflags='-static-libstdc++'
         libretro="y"
         opts="$opts --cross-prefix=llvm- --host-cc=cc --cpu=aarch64

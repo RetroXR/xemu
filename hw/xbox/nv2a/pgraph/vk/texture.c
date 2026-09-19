@@ -494,7 +494,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
         for (int level_idx = 0; level_idx < state->levels; level_idx++) {
             size_t size = layer->levels[level_idx].decoded_size;
             assert(size);
-            texture_data_size += size;
+            texture_data_size += ROUND_UP(size, 4);
         }
     }
 
@@ -537,7 +537,13 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
                 .imageExtent =
                     (VkExtent3D){ level->width, level->height, level->depth },
             };
-            buffer_offset += level->decoded_size;
+            /*
+             * A multiple of the texel size is all that is required today,
+             * but it used to be a multiple of 4 and not every driver copes
+             * with less: small mip levels of 8 and 16 bit formats would
+             * leave every level and cube map face behind them misaligned.
+             */
+            buffer_offset += ROUND_UP(level->decoded_size, 4);
             region++;
         }
     }
@@ -585,6 +591,59 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     pgraph_vk_end_debug_marker(r, cmd);
     pgraph_vk_end_single_time_commands(pg, cmd);
 
+    /* Debugging aid: read every level back and compare with what went in */
+    if (getenv("XEMU_VK_VERIFY_TEXTURES")) {
+        StorageBuffer *dst = &r->storage_buffers[BUFFER_STAGING_DST];
+        for (int i = 0; i < num_regions; i++) {
+            TextureLevel *level =
+                &layout->layers[i / state->levels].levels[i % state->levels];
+            if (level->decoded_size > dst->buffer_size) {
+                continue;
+            }
+
+            cmd = pgraph_vk_begin_single_time_commands(pg);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, binding->image, vkf.vk_format,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, binding->image, vkf.vk_format,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy readback = regions[i];
+            readback.bufferOffset = 0;
+            vkCmdCopyImageToBuffer(cmd, binding->image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   dst->buffer, 1, &readback);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, binding->image, vkf.vk_format,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, binding->image, vkf.vk_format,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            pgraph_vk_end_single_time_commands(pg, cmd);
+
+            uint8_t *mapped;
+            VK_CHECK(vmaMapMemory(r->allocator, dst->allocation,
+                                  (void *)&mapped));
+            vmaInvalidateAllocation(r->allocator, dst->allocation, 0,
+                                    VK_WHOLE_SIZE);
+            size_t bad = 0;
+            for (size_t b = 0; b < level->decoded_size; b++) {
+                bad += mapped[b] != ((uint8_t *)level->decoded_data)[b];
+            }
+            vmaUnmapMemory(r->allocator, dst->allocation);
+            fprintf(stderr,
+                    "verify: fmt=%d %dx%dx%d region %d/%d size=%zu "
+                    "mismatched=%zu%s", vkf.vk_format, level->width,
+                    level->height, level->depth, i, num_regions,
+                    (size_t)level->decoded_size, bad, bad ? " <==" : "");
+            fputc(10, stderr);
+        }
+    }
+
     // Release decoded texture data
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
         TextureLayer *layer = &layout->layers[layer_idx];
@@ -592,6 +651,25 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
             g_free(layer->levels[level_idx].decoded_data);
         }
     }
+}
+
+/*
+ * A texture that is filled from a surface is often larger than the surface,
+ * and whatever the copy does not cover is never written. Desktop GPUs hand
+ * out zeroed memory, so sampling it gives black. Tile based ones do not, and
+ * effects that read past the rendered area pick up garbage.
+ */
+static void clear_new_texture(VkCommandBuffer cmd, TextureBinding *texture)
+{
+    VkClearColorValue clear_color = { 0 };
+    VkImageSubresourceRange range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .levelCount = VK_REMAINING_MIP_LEVELS,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    vkCmdClearColorImage(cmd, texture->image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, 1,
+                         &range);
 }
 
 static void copy_zeta_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
@@ -761,10 +839,14 @@ static void copy_zeta_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surfac
         texture_source_buffer = dst_storage_buffer->buffer;
     }
 
+    bool is_new_texture = texture->current_layout == VK_IMAGE_LAYOUT_UNDEFINED;
     pgraph_vk_transition_image_layout(pg, cmd, texture->image, vkf.vk_format,
                                       texture->current_layout,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     texture->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (is_new_texture) {
+        clear_new_texture(cmd, texture);
+    }
 
     regions[0] = (VkBufferImageCopy){
         .bufferOffset = 0,
@@ -832,10 +914,14 @@ static void copy_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
+    bool is_new_texture = texture->current_layout == VK_IMAGE_LAYOUT_UNDEFINED;
     pgraph_vk_transition_image_layout(pg, cmd, texture->image, vkf.vk_format,
                                       texture->current_layout,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     texture->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (is_new_texture) {
+        clear_new_texture(cmd, texture);
+    }
 
     VkImageCopy region = {
         .srcSubresource.aspectMask = surface->host_fmt.aspect,
@@ -921,7 +1007,9 @@ static void create_dummy_texture(PGRAPHState *pg)
         .format = VK_FORMAT_R8_UNORM,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 (getenv("XEMU_VK_VERIFY_TEXTURES") ?
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .flags = 0,
@@ -1121,6 +1209,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
 
     // Check active surfaces to see if this texture was a render target
     SurfaceBinding *surface = pgraph_vk_surface_get(d, texture_vram_offset);
+    static int no_surface_to_texture = -1;
+    if (no_surface_to_texture < 0) {
+        no_surface_to_texture = getenv("XEMU_VK_NO_SURF_TO_TEX") != NULL;
+    }
+    if (no_surface_to_texture) {
+        /* Debugging aid: go through guest memory instead */
+        surface = NULL;
+    }
     if (surface && state.levels == 1) {
         surface_to_texture =
             check_surface_to_texture_compatiblity(surface, &state);
@@ -1210,6 +1306,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     assert(state.dimensionality <
            ARRAY_SIZE(dimensionality_to_vk_image_view_type));
 
+    if (getenv("XEMU_VK_DEBUG_TEXTURES")) {
+        fprintf(stderr, "texture: nv=0x%02x vk=%d %ux%ux%u dim=%u levels=%u "
+                "cube=%d linear=%d surface=%d\n", state.color_format,
+                vkf.vk_format, state.width, state.height, state.depth,
+                state.dimensionality, state.levels, state.cubemap,
+                f_basic.linear, surface != NULL);
+    }
+
     VkImageCreateInfo image_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = dimensionality_to_vk_image_type[state.dimensionality],
@@ -1221,7 +1325,9 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         .format = vkf.vk_format,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 (getenv("XEMU_VK_VERIFY_TEXTURES") ?
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .flags = (state.cubemap ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
