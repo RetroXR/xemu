@@ -142,6 +142,12 @@ void pgraph_vk_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
                 container_of(pg, NV2AState, pgraph), surface);
         }
     }
+    QTAILQ_FOREACH(surface, &r->shelved_surfaces, entry) {
+        if (check_surface_overlaps_range(surface, start, size)) {
+            pgraph_vk_surface_download_if_dirty(
+                container_of(pg, NV2AState, pgraph), surface);
+        }
+    }
 }
 
 static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
@@ -516,6 +522,9 @@ void pgraph_vk_process_pending_downloads(NV2AState *d)
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         download_surface(d, surface, false);
     }
+    QTAILQ_FOREACH(surface, &r->shelved_surfaces, entry) {
+        download_surface(d, surface, false);
+    }
 
     qatomic_set(&r->downloads_pending, false);
     qemu_event_set(&r->downloads_complete);
@@ -529,9 +538,38 @@ void pgraph_vk_download_dirty_surfaces(NV2AState *d)
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         pgraph_vk_surface_download_if_dirty(d, surface);
     }
+    QTAILQ_FOREACH(surface, &r->shelved_surfaces, entry) {
+        pgraph_vk_surface_download_if_dirty(d, surface);
+    }
 
     qatomic_set(&r->download_dirty_surfaces_pending, false);
     qemu_event_set(&r->dirty_surfaces_download_complete);
+}
+
+static bool surface_accessed(SurfaceBinding *surface, hwaddr addr, hwaddr len,
+                             bool write)
+{
+    if (!check_surface_overlaps_range(surface, addr, len)) {
+        return false;
+    }
+
+    hwaddr offset = addr - surface->vram_addr;
+
+    if (write) {
+        trace_nv2a_pgraph_surface_cpu_write(surface->vram_addr, offset);
+    } else {
+        trace_nv2a_pgraph_surface_cpu_read(surface->vram_addr, offset);
+    }
+
+    if (write) {
+        surface->upload_pending = true;
+    }
+
+    if (surface->draw_dirty) {
+        surface->download_pending = true;
+        return true;
+    }
+    return false;
 }
 
 static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
@@ -545,26 +583,10 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
 
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
-        if (!check_surface_overlaps_range(surface, addr, len)) {
-            continue;
-        }
-
-        hwaddr offset = addr - surface->vram_addr;
-
-        if (write) {
-            trace_nv2a_pgraph_surface_cpu_write(surface->vram_addr, offset);
-        } else {
-            trace_nv2a_pgraph_surface_cpu_read(surface->vram_addr, offset);
-        }
-
-        if (surface->draw_dirty) {
-            surface->download_pending = true;
-            wait_for_downloads = true;
-        }
-
-        if (write) {
-            surface->upload_pending = true;
-        }
+        wait_for_downloads |= surface_accessed(surface, addr, len, write);
+    }
+    QTAILQ_FOREACH(surface, &r->shelved_surfaces, entry) {
+        wait_for_downloads |= surface_accessed(surface, addr, len, write);
     }
 
     qemu_mutex_unlock(&d->pgraph.lock);
@@ -658,6 +680,80 @@ static void invalidate_surface(NV2AState *d, SurfaceBinding *surface)
     QTAILQ_INSERT_HEAD(&r->invalid_surfaces, surface, entry);
 }
 
+/*
+ * Games bind depth buffers of different shapes at one address, typically a
+ * small render target borrowing the memory of the main depth buffer, and
+ * switch between them several times per frame. Evicting the other surface
+ * each time means downloading it (through a compute pass for depth) and
+ * uploading it again when it comes back, with a finished command buffer for
+ * each. A depth surface that is displaced by another one at its own address is
+ * shelved instead: it keeps its image and its CPU access callback and returns
+ * untouched. Everything else that involves its memory still gets it downloaded
+ * first. The difference to hardware is that the two do not overwrite each
+ * other, which no game can make use of.
+ */
+#define MAX_SHELVED_SURFACES 8
+
+static void shelve_surface(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    assert(!surface->color);
+    trace_nv2a_pgraph_surface_evict_reason("shelved", surface->vram_addr);
+
+    if (surface == r->zeta_binding) {
+        unbind_surface(d, false);
+    }
+
+    QTAILQ_REMOVE(&r->surfaces, surface, entry);
+    QTAILQ_INSERT_HEAD(&r->shelved_surfaces, surface, entry);
+}
+
+static void retire_shelved_surface(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    trace_nv2a_pgraph_surface_evict_reason("unshelved", surface->vram_addr);
+    pgraph_vk_surface_download_if_dirty(d, surface);
+
+    // The image may be in use by the command buffer that is being recorded
+    pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_SURFACE_DOWN);
+
+    unregister_cpu_access_callback(d, surface);
+    QTAILQ_REMOVE(&r->shelved_surfaces, surface, entry);
+    QTAILQ_INSERT_HEAD(&r->invalid_surfaces, surface, entry);
+}
+
+static void retire_all_shelved_surfaces(NV2AState *d)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    SurfaceBinding *s, *next;
+    QTAILQ_FOREACH_SAFE(s, &r->shelved_surfaces, entry, next) {
+        retire_shelved_surface(d, s);
+    }
+}
+
+static bool check_surface_compatibility(SurfaceBinding const *s1,
+                                        SurfaceBinding const *s2, bool strict);
+
+static SurfaceBinding *take_shelved_surface(NV2AState *d,
+                                            SurfaceBinding const *target)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    SurfaceBinding *s;
+    QTAILQ_FOREACH(s, &r->shelved_surfaces, entry) {
+        if (s->vram_addr == target->vram_addr &&
+            s->swizzle == target->swizzle &&
+            check_surface_compatibility(s, target, true)) {
+            QTAILQ_REMOVE(&r->shelved_surfaces, s, entry);
+            return s;
+        }
+    }
+    return NULL;
+}
+
 static bool check_surfaces_overlap(const SurfaceBinding *surface,
                                    const SurfaceBinding *other_surface)
 {
@@ -680,6 +776,17 @@ static void invalidate_overlapping_surfaces(NV2AState *d,
             invalidate_surface(d, other_surface);
         }
     }
+
+    int num_shelved = 0;
+    QTAILQ_FOREACH_SAFE (other_surface, &r->shelved_surfaces, entry,
+                         next_surface) {
+        bool partner = !surface->color &&
+                       other_surface->vram_addr == surface->vram_addr;
+        if ((check_surfaces_overlap(surface, other_surface) && !partner) ||
+            ++num_shelved > MAX_SHELVED_SURFACES) {
+            retire_shelved_surface(d, other_surface);
+        }
+    }
 }
 
 static void surface_put(NV2AState *d, SurfaceBinding *surface)
@@ -691,6 +798,17 @@ static void surface_put(NV2AState *d, SurfaceBinding *surface)
     invalidate_overlapping_surfaces(d, surface);
     register_cpu_access_callback(d, surface);
 
+    QTAILQ_INSERT_HEAD(&r->surfaces, surface, entry);
+}
+
+/* A surface from the shelf has its callback, and nothing to upload */
+static void surface_put_back(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    assert(pgraph_vk_surface_get(d, surface->vram_addr) == NULL);
+
+    invalidate_overlapping_surfaces(d, surface);
     QTAILQ_INSERT_HEAD(&r->surfaces, surface, entry);
 }
 
@@ -942,6 +1060,12 @@ static void expire_old_surfaces(NV2AState *d)
             invalidate_surface(d, s);
         }
     }
+    QTAILQ_FOREACH_SAFE(s, &r->shelved_surfaces, entry, next) {
+        int last_used = d->pgraph.frame_time - s->frame_time;
+        if (last_used >= max_surface_frame_time_delta) {
+            retire_shelved_surface(d, s);
+        }
+    }
 }
 
 static bool check_surface_compatibility(SurfaceBinding const *s1,
@@ -981,7 +1105,14 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_UPLOAD);
 
-    pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_CREATE); // FIXME: SURFACE_UP
+    /*
+     * The upload is submitted at once, ahead of the draws that are recorded
+     * and still to be submitted, which may use what the surface holds now. A
+     * surface that was only just created has not been used by any.
+     */
+    if (surface->initialized) {
+        pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_CREATE); // FIXME: SURFACE_UP
+    }
 
     trace_nv2a_pgraph_surface_upload(
                  surface->color ? "COLOR" : "ZETA",
@@ -1538,23 +1669,32 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 trace_nv2a_pgraph_surface_evict_reason(
                     "incompatible", surface->vram_addr);
                 compare_surfaces(surface, &target);
-                pgraph_vk_surface_download_if_dirty(d, surface);
-                invalidate_surface(d, surface);
+                if (!color && !surface->color) {
+                    shelve_surface(d, surface);
+                } else {
+                    pgraph_vk_surface_download_if_dirty(d, surface);
+                    invalidate_surface(d, surface);
+                }
             }
         }
 
         if (should_create) {
-            surface = get_any_compatible_invalid_surface(r, &target);
+            surface = color ? NULL : take_shelved_surface(d, &target);
             if (surface) {
-                migrate_surface_image(&target, surface);
+                surface_put_back(d, surface);
             } else {
-                surface = g_malloc(sizeof(SurfaceBinding));
-                create_surface_image(pg, &target);
-            }
+                surface = get_any_compatible_invalid_surface(r, &target);
+                if (surface) {
+                    migrate_surface_image(&target, surface);
+                } else {
+                    surface = g_malloc(sizeof(SurfaceBinding));
+                    create_surface_image(pg, &target);
+                }
 
-            *surface = target;
-            set_surface_label(pg, surface);
-            surface_put(d, surface);
+                *surface = target;
+                set_surface_label(pg, surface);
+                surface_put(d, surface);
+            }
 
             // FIXME: Refactor
             pg->surface_binding_dim.width = target.width;
@@ -1605,6 +1745,8 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
                               bool zeta_write)
 {
     PGRAPHState *pg = &d->pgraph;
+
+    pgraph_vk_complete_finish(pg);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     pg->surface_shape.z_format =
@@ -1743,6 +1885,7 @@ void pgraph_vk_init_surfaces(PGRAPHState *pg)
     }
 
     QTAILQ_INIT(&r->surfaces);
+    QTAILQ_INIT(&r->shelved_surfaces);
     QTAILQ_INIT(&r->invalid_surfaces);
 
     r->downloads_pending = false;
@@ -1780,6 +1923,7 @@ void pgraph_vk_surface_flush(NV2AState *d)
         pgraph_vk_surface_download_if_dirty(d, s);
         invalidate_surface(d, s);
     }
+    retire_all_shelved_surfaces(d);
     prune_invalid_surfaces(r, 0);
 
     pgraph_vk_reload_surface_scale_factor(pg);
