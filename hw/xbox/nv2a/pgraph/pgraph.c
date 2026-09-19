@@ -550,7 +550,8 @@ static void pgraph_method_log(unsigned int subchannel,
                                         method_name, count);
     }
 
-    if (method != NV097_ARRAY_ELEMENT16) {
+    if (method != NV097_ARRAY_ELEMENT16 &&
+        trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD)) {
         uint32_t base = method;
         switch (graphics_class) {
         case NV_KELVIN_PRIMITIVE: {
