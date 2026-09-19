@@ -296,7 +296,12 @@ void tcg_gen_br(TCGLabel *l)
 
 void tcg_gen_mb(TCGBar mb_type)
 {
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) || defined(XBOX)
+    /*
+     * XBOX: There is one vCPU. The device threads that read guest memory are
+     * started through MMIO, whose locks order memory for them, and a barrier
+     * around every guest memory access is expensive on AArch64 hosts.
+     */
     bool parallel = tcg_ctx->gen_tb->cflags & CF_PARALLEL;
 #else
     /*
