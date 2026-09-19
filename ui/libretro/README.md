@@ -62,7 +62,13 @@ and the files in the system directory stay as they were. Delete the copies to
 start over. The "Hard Disk Image" core option uses the image in the system
 directory in place instead, which suits large images with installed software.
 Memory units enabled through the core options are 8 MiB FATX images in the
-same folder of the save directory. Written images are flushed once the guest
+same folder of the save directory: `memory_unit_port<N>.img` for the top slot
+(A) of a controller and `memory_unit_port<N>b.img` for the bottom one (B).
+The options are applied while a game runs, and a unit that is disabled has
+been unplugged and its image closed by the time `retro_run()` returns, so a
+frontend can swap the files. A message tells when the console has detected a
+unit and when it first reads from and writes to it, since few games show
+memory units and the stock hard disk image has no dashboard that would. Written images are flushed once the guest
 stops writing, so that a frontend that gets killed does not take a save with
 it.
 
@@ -116,7 +122,7 @@ again in the same process, so this is not a conventional core:
 - Core options (v2 with categories, v1 fallback): memory, AV pack, boot
   animation, hard FPU, hard disk location, renderer, internal resolution scale,
   aspect ratio, output filtering, shader cache, DSP, HRTF, and a memory unit
-  per port.
+  for each of the two expansion slots of every port.
 - `xemu_libretro.info` in this directory is the matching core info file.
 
 Set `XEMU_LIBRETRO_LOG=<file>` to send the core's stdout/stderr (QEMU's own

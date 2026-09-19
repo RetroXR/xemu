@@ -19,16 +19,29 @@
 
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
+#include "hw/usb.h"
+#include "block/accounting.h"
+#include "block/block_int.h"
+#include "system/block-backend.h"
 #include "ui/xemu-input.h"
 #include "ui/xemu-notifications.h"
 #include "fatx.h"
 #include "xemu-libretro.h"
+#include "libretro.h"
 
 static GMutex pad_lock;
 static XemuLibretroPadState pad_state[XEMU_LIBRETRO_NUM_PORTS];
 static bool port_connected[XEMU_LIBRETRO_NUM_PORTS] = { true };
 static bool port_controller_s[XEMU_LIBRETRO_NUM_PORTS];
-static char *port_memory_unit[XEMU_LIBRETRO_NUM_PORTS];
+static char *port_memory_unit[XEMU_LIBRETRO_NUM_PORTS][XEMU_LIBRETRO_NUM_SLOTS];
+
+/* What the guest has done with a memory unit, for the messages about it */
+enum {
+    UNIT_CONFIGURED = 1 << 0,
+    UNIT_READ = 1 << 1,
+    UNIT_WRITTEN = 1 << 2,
+};
+static int unit_reported[XEMU_LIBRETRO_NUM_PORTS][XEMU_LIBRETRO_NUM_SLOTS];
 static uint16_t rumble[XEMU_LIBRETRO_NUM_PORTS][2];
 static bool rumble_dirty[XEMU_LIBRETRO_NUM_PORTS];
 
@@ -54,11 +67,11 @@ void xemu_libretro_input_set_port_device(int port, bool connected,
     g_mutex_unlock(&pad_lock);
 }
 
-void xemu_libretro_input_set_memory_unit(int port, const char *path)
+void xemu_libretro_input_set_memory_unit(int port, int slot, const char *path)
 {
     g_mutex_lock(&pad_lock);
-    g_free(port_memory_unit[port]);
-    port_memory_unit[port] = g_strdup(path);
+    g_free(port_memory_unit[port][slot]);
+    port_memory_unit[port][slot] = g_strdup(path);
     g_mutex_unlock(&pad_lock);
 }
 
@@ -115,14 +128,13 @@ void xemu_libretro_input_init(void)
     xemu_libretro_input_sync_ports();
 }
 
-/* Memory units go into the top expansion slot */
-#define MEMORY_UNIT_SLOT 0
 #define MEMORY_UNIT_SIZE (8 * 1024 * 1024)
 
-static void sync_memory_unit(int port, const char *path)
+/* Slot 0 is the top one of the controller, "A" to the guest */
+static void sync_memory_unit(int port, int slot, const char *path)
 {
     ControllerState *con = &controllers[port];
-    XmuState *xmu = con->peripherals[MEMORY_UNIT_SLOT];
+    XmuState *xmu = con->peripherals[slot];
     const char *current = xmu ? xmu->filename : NULL;
 
     if (!g_strcmp0(current, path)) {
@@ -130,11 +142,13 @@ static void sync_memory_unit(int port, const char *path)
     }
 
     if (xmu) {
-        xemu_input_unbind_xmu(port, MEMORY_UNIT_SLOT);
+        /* Unplugging deletes the drive, which flushes and closes the image */
+        xemu_input_unbind_xmu(port, slot);
         g_free(xmu);
-        con->peripherals[MEMORY_UNIT_SLOT] = NULL;
-        con->peripheral_types[MEMORY_UNIT_SLOT] = PERIPHERAL_NONE;
+        con->peripherals[slot] = NULL;
+        con->peripheral_types[slot] = PERIPHERAL_NONE;
     }
+    unit_reported[port][slot] = 0;
 
     if (!path) {
         return;
@@ -148,9 +162,67 @@ static void sync_memory_unit(int port, const char *path)
         return;
     }
 
-    con->peripheral_types[MEMORY_UNIT_SLOT] = PERIPHERAL_XMU;
-    con->peripherals[MEMORY_UNIT_SLOT] = g_new0(XmuState, 1);
-    xemu_input_bind_xmu(port, MEMORY_UNIT_SLOT, path, true);
+    con->peripheral_types[slot] = PERIPHERAL_XMU;
+    con->peripherals[slot] = g_new0(XmuState, 1);
+    xemu_input_bind_xmu(port, slot, path, true);
+}
+
+/*
+ * Tell the user, once each, when the guest has configured a memory unit and
+ * when it first reads from and writes to it. Few games show memory units, and
+ * without a dashboard on the hard disk nothing else does.
+ */
+void xemu_libretro_input_report_memory_units(void)
+{
+    assert(bql_locked());
+
+    for (int port = 0; port < XEMU_LIBRETRO_NUM_PORTS; port++) {
+        for (int slot = 0; slot < XEMU_LIBRETRO_NUM_SLOTS; slot++) {
+            ControllerState *con = &controllers[port];
+            XmuState *xmu = con->bound >= 0 ? con->peripherals[slot] : NULL;
+            if (!xmu || !xmu->dev || !xmu->filename) {
+                continue;
+            }
+
+            int state = 0;
+            if (USB_DEVICE(xmu->dev)->configuration) {
+                state |= UNIT_CONFIGURED;
+            }
+            for (BlockBackend *blk = blk_all_next(NULL); blk;
+                 blk = blk_all_next(blk)) {
+                BlockDriverState *bs = blk_bs(blk);
+                if (!bs || strcmp(bs->filename, xmu->filename)) {
+                    continue;
+                }
+                BlockAcctStats *stats = blk_get_stats(blk);
+                if (stats->nr_bytes[BLOCK_ACCT_READ]) {
+                    state |= UNIT_READ;
+                }
+                if (stats->nr_bytes[BLOCK_ACCT_WRITE]) {
+                    state |= UNIT_WRITTEN;
+                }
+            }
+
+            static const struct {
+                int bit;
+                const char *what;
+            } events[] = {
+                { UNIT_CONFIGURED, "detected by the console" },
+                { UNIT_READ, "read by the console" },
+                { UNIT_WRITTEN, "written to by the console" },
+            };
+            for (int i = 0; i < ARRAY_SIZE(events); i++) {
+                if ((state & ~unit_reported[port][slot]) & events[i].bit) {
+                    char *msg = g_strdup_printf("xemu: memory unit %d%c %s",
+                                                port + 1, 'A' + slot,
+                                                events[i].what);
+                    xemu_libretro_queue_message(RETRO_LOG_WARN, msg);
+                    g_free(msg);
+                }
+            }
+            unit_reported[port][slot] |= state;
+        }
+    }
 }
 
 void xemu_libretro_input_sync_ports(void)
@@ -161,12 +233,15 @@ void xemu_libretro_input_sync_ports(void)
         g_mutex_lock(&pad_lock);
         bool connected = port_connected[i];
         const char *driver = port_controller_s[i] ? DRIVER_S : DRIVER_DUKE;
-        char *memory_unit = g_strdup(port_memory_unit[i]);
+        char *memory_units[XEMU_LIBRETRO_NUM_SLOTS];
+        for (int slot = 0; slot < XEMU_LIBRETRO_NUM_SLOTS; slot++) {
+            memory_units[slot] = g_strdup(port_memory_unit[i][slot]);
+        }
         g_mutex_unlock(&pad_lock);
 
         bool bound = controllers[i].bound >= 0;
         if (bound && (!connected || strcmp(bound_drivers[i], driver))) {
-            /* Unplugging the pad takes its memory unit along */
+            /* Unplugging the pad takes its memory units along */
             xemu_input_bind(i, NULL, 0);
             bound = false;
         }
@@ -175,10 +250,11 @@ void xemu_libretro_input_sync_ports(void)
             xemu_input_bind(i, &controllers[i], 0);
             bound = true;
         }
-        if (bound) {
-            sync_memory_unit(i, memory_unit);
+        for (int slot = 0; slot < XEMU_LIBRETRO_NUM_SLOTS; slot++) {
+            if (bound) {
+                sync_memory_unit(i, slot, memory_units[slot]);
+            }
+            g_free(memory_units[slot]);
         }
-
-        g_free(memory_unit);
     }
 }

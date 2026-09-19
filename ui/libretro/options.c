@@ -31,13 +31,14 @@ static struct retro_core_option_v2_category categories[] = {
     { NULL, NULL, NULL },
 };
 
-#define MEMORY_UNIT(port)                                                    \
+/* Slot A is the top one; its key has no suffix for compatibility */
+#define MEMORY_UNIT(port, suffix, slot, where)                               \
     {                                                                        \
-        "xemu_memory_unit_port" #port,                                       \
-        "Input > Port " #port " Memory Unit",                                \
-        "Port " #port " Memory Unit",                                        \
-        "Insert an 8 MiB memory unit into the top expansion slot of the "    \
-        "controller. The image is kept in the save directory.",              \
+        "xemu_memory_unit_port" #port suffix,                                \
+        "Input > Port " #port " Memory Unit " slot,                          \
+        "Port " #port " Memory Unit " slot,                                  \
+        "Insert an 8 MiB memory unit into the " where " expansion slot of "  \
+        "the controller. The image is kept in the save directory.",          \
         NULL,                                                                \
         "input",                                                             \
         { { "disabled", NULL }, { "enabled", NULL }, { NULL, NULL } },       \
@@ -203,10 +204,14 @@ static struct retro_core_option_v2_definition definitions[] = {
         { { "enabled", NULL }, { "disabled", NULL }, { NULL, NULL } },
         "enabled",
     },
-    MEMORY_UNIT(1),
-    MEMORY_UNIT(2),
-    MEMORY_UNIT(3),
-    MEMORY_UNIT(4),
+    MEMORY_UNIT(1, "", "A", "top"),
+    MEMORY_UNIT(1, "b", "B", "bottom"),
+    MEMORY_UNIT(2, "", "A", "top"),
+    MEMORY_UNIT(2, "b", "B", "bottom"),
+    MEMORY_UNIT(3, "", "A", "top"),
+    MEMORY_UNIT(3, "b", "B", "bottom"),
+    MEMORY_UNIT(4, "", "A", "top"),
+    MEMORY_UNIT(4, "b", "B", "bottom"),
     { NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
 

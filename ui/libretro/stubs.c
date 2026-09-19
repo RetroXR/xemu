@@ -30,13 +30,26 @@
 static GMutex msg_lock;
 static GQueue msg_queue = G_QUEUE_INIT;
 
+typedef struct QueuedMessage {
+    int level;
+    char *text;
+} QueuedMessage;
+
+/* Logged when flushed: only then is it safe to use the frontend's log */
 static void queue_message(int level, const char *msg)
 {
-    xemu_libretro_log(level, "%s\n", msg);
+    QueuedMessage *m = g_new(QueuedMessage, 1);
+    m->level = level;
+    m->text = g_strdup(msg);
 
     g_mutex_lock(&msg_lock);
-    g_queue_push_tail(&msg_queue, g_strdup(msg));
+    g_queue_push_tail(&msg_queue, m);
     g_mutex_unlock(&msg_lock);
+}
+
+void xemu_libretro_queue_message(int level, const char *msg)
+{
+    queue_message(level, msg);
 }
 
 void xemu_queue_notification(const char *msg)
@@ -53,14 +66,16 @@ void xemu_libretro_flush_messages(bool (*environ_cb)(unsigned cmd, void *data))
 {
     for (;;) {
         g_mutex_lock(&msg_lock);
-        char *msg = g_queue_pop_head(&msg_queue);
+        QueuedMessage *msg = g_queue_pop_head(&msg_queue);
         g_mutex_unlock(&msg_lock);
         if (!msg) {
             break;
         }
 
-        struct retro_message m = { msg, 300 };
+        xemu_libretro_log(msg->level, "%s\n", msg->text);
+        struct retro_message m = { msg->text, 300 };
         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &m);
+        g_free(msg->text);
         g_free(msg);
     }
 }

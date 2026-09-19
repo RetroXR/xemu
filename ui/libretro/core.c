@@ -400,6 +400,21 @@ static void flush_written_disks(void)
     xemu_main_loop_unlock();
 }
 
+static void report_memory_units(void)
+{
+    static int64_t next_check;
+
+    int64_t now = g_get_monotonic_time();
+    if (now < next_check) {
+        return;
+    }
+    next_check = now + G_USEC_PER_SEC / 2;
+
+    xemu_main_loop_lock();
+    xemu_libretro_input_report_memory_units();
+    xemu_main_loop_unlock();
+}
+
 static void *core_thread_fn(void *opaque)
 {
     if (!xemu_libretro_video_init()) {
@@ -434,6 +449,7 @@ static void *core_thread_fn(void *opaque)
 
         process_commands();
         flush_written_disks();
+        report_memory_units();
 
         g_mutex_lock(&state_lock);
         if (frame_state != FRAME_REQUESTED) {
@@ -507,23 +523,44 @@ static void apply_variables(bool startup)
     const char *save_dir = NULL;
     environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
     for (int port = 0; port < XEMU_LIBRETRO_NUM_PORTS; port++) {
-        char key[32];
-        snprintf(key, sizeof(key), "xemu_memory_unit_port%d", port + 1);
+        for (int slot = 0; slot < XEMU_LIBRETRO_NUM_SLOTS; slot++) {
+            /* Slot A had no suffix when it was the only one */
+            const char *suffix = slot ? "b" : "";
+            char key[40];
+            snprintf(key, sizeof(key), "xemu_memory_unit_port%d%s", port + 1,
+                     suffix);
 
-        char *path = NULL;
-        if (save_dir && *save_dir && variable_is(key, "enabled", false)) {
-            char *dir = g_build_filename(save_dir, "xemu", NULL);
-            char *name = g_strdup_printf("memory_unit_port%d.img", port + 1);
-            g_mkdir_with_parents(dir, 0755);
-            path = g_build_filename(dir, name, NULL);
-            g_free(name);
-            g_free(dir);
+            char *path = NULL;
+            if (save_dir && *save_dir && variable_is(key, "enabled", false)) {
+                char *dir = g_build_filename(save_dir, "xemu", NULL);
+                char *name = g_strdup_printf("memory_unit_port%d%s.img",
+                                             port + 1, suffix);
+                g_mkdir_with_parents(dir, 0755);
+                path = g_build_filename(dir, name, NULL);
+                g_free(name);
+                g_free(dir);
+            }
+            xemu_libretro_input_set_memory_unit(port, slot, path);
+            g_free(path);
         }
-        xemu_libretro_input_set_memory_unit(port, path);
-        g_free(path);
     }
+
+    /*
+     * A frontend that manages the images pulls a unit by disabling it and
+     * then takes the file, so have the ports brought in line, which closes
+     * the image of a unit that goes, before returning.
+     */
     g_mutex_lock(&state_lock);
     cmd_sync_ports = true;
+    unsigned ticket = ++cmds_posted;
+    g_cond_broadcast(&state_cond);
+    int64_t deadline = g_get_monotonic_time() + G_USEC_PER_SEC;
+    while (!startup && core_state == CORE_RUNNING &&
+           (int)(cmds_done - ticket) < 0) {
+        if (!g_cond_wait_until(&state_cond, &state_lock, deadline)) {
+            break;
+        }
+    }
     g_mutex_unlock(&state_lock);
 
     int scale = get_scale_variable();

@@ -63,7 +63,10 @@ void xemu_libretro_input_set_pad_state(int port,
                                        const XemuLibretroPadState *state);
 void xemu_libretro_input_set_port_device(int port, bool connected,
                                          bool controller_s);
-void xemu_libretro_input_set_memory_unit(int port, const char *path);
+#define XEMU_LIBRETRO_NUM_SLOTS 2
+void xemu_libretro_input_set_memory_unit(int port, int slot, const char *path);
+void xemu_libretro_input_report_memory_units(void);
+void xemu_libretro_queue_message(int level, const char *msg);
 bool xemu_libretro_input_get_rumble(int port, uint16_t *left, uint16_t *right);
 
 /* Called on the core thread, with the BQL held (init is in xemu-input.h) */
