@@ -649,9 +649,14 @@ static bool configure(const char *game_path)
     g_config.general.updates.check = false;
     g_config.general.skip_boot_anim =
         variable_is("xemu_skip_boot_anim", "enabled", false);
+#ifdef CONFIG_OPENGL
     g_config.display.renderer = variable_is("xemu_renderer", "vulkan", false) ?
                                     CONFIG_DISPLAY_RENDERER_VULKAN :
                                     CONFIG_DISPLAY_RENDERER_OPENGL;
+#else
+    /* Builds without GL, such as Android, only have the one */
+    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_VULKAN;
+#endif
     g_config.sys.mem_limit = variable_is("xemu_memory", "128 MiB", false) ?
                                  CONFIG_SYS_MEM_LIMIT_128 :
                                  CONFIG_SYS_MEM_LIMIT_64;
