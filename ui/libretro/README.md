@@ -1,13 +1,46 @@
 # xemu libretro core
 
 Builds xemu as `xemu_libretro.{dll,so,dylib}` instead of the standalone
-executable. Only the Windows build (cross-compiled, as CI does for xemu itself)
-has been tested so far.
+executable. The Windows build (cross-compiled, as CI does for xemu itself) and
+the Android build have been tested; Linux and macOS have not been tried.
 
 ```bash
 ./build.sh -p win64-cross --libretro    # dist/xemu_libretro.dll
 ./build.sh --libretro                   # native; same as configure --enable-libretro
 ```
+
+### Android
+
+```bash
+ANDROID_NDK_ROOT=... ANDROID_DEPS=... ./build.sh -p android   # dist/xemu_libretro_android.so
+```
+
+`ANDROID_DEPS` is a prefix with static glib (plus libffi, pcre2, intl), pixman,
+libslirp, libsamplerate, libpcap and SDL3 built for `aarch64-linux-android`.
+SDL is only there for its headers and platform independent helpers; none of
+it that needs a Java side is called. There is no desktop GL on Android, so
+this build has no GL at all (`--disable-opengl`): the Vulkan renderer is the
+only one, its display image is read back, and the DSP JIT (a prebuilt library)
+is replaced by the interpreter.
+
+Tested on a Quest 3 (Adreno 740): Halo runs at its native 30 fps. What it took
+beyond building, all in `hw/xbox/nv2a/pgraph/vk/` and harmless elsewhere:
+
+- The geometry shader stage cannot be used for ordinary draws on Adreno, see
+  `avoid_geometry_shader` in `GPUProperties`. Quads, lines and the line and
+  point polygon modes still go through it.
+- Images are initialized when created; mobile GPUs do not hand out zeroed
+  memory.
+- The scratch buffers respect `maxMemoryAllocationSize` and are much smaller
+  on integrated GPUs.
+- Mapped memory is required to be coherent, shaders declare that they need
+  infinities and NaNs preserved, and `A4R4G4B4` textures use the mandatory
+  `R4G4B4A4` format with the components rotated.
+
+Android only loads Vulkan layers for debuggable applications.
+`XEMU_VK_LAYER_PATH=<libVkLayer_khronos_validation.so>` chains the validation
+layer in by hand instead (`vk/layer-shim.c`), which also works for a test host
+started from `adb shell`.
 
 ## Setup
 
@@ -50,11 +83,12 @@ again in the same process, so this is not a conventional core:
 - The library pins itself in memory when it is loaded. QEMU starts threads
   from constructors, so a frontend that loads the core just to query it and
   unloads it again would otherwise pull the code out from under them.
-- Video is a software framebuffer. The NV2A renderers (OpenGL and Vulkan alike)
-  present through a GL texture in a context group owned by the core, so the
-  frame is drawn into an FBO on a hidden SDL window's context and read back.
-  That makes the core independent of the frontend's video driver, at the cost
-  of a readback per frame. It still needs an OpenGL 4.0 driver.
+- Video is a software framebuffer, which makes the core independent of the
+  frontend's video driver at the cost of a readback per frame. The Vulkan
+  renderer reads its display image back itself and needs no GL. The OpenGL
+  renderer presents through a texture in a context group owned by the core,
+  which is drawn into an FBO on a hidden SDL window's context and read back;
+  that one needs an OpenGL 4.0 driver.
 
 ## Frontend facing features
 
