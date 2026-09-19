@@ -928,6 +928,11 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
             if (qatomic_read(&jc->array[h].tb) == tb) {
                 qatomic_set(&jc->array[h].tb, NULL);
             }
+#ifdef XBOX
+            if (qatomic_read(&jc->victim[h].tb) == tb) {
+                qatomic_set(&jc->victim[h].tb, NULL);
+            }
+#endif
         }
     }
 }

@@ -33,6 +33,17 @@ typedef struct CPUJumpCache {
         TranslationBlock *tb;
         vaddr pc;
     } array[TB_JMP_CACHE_SIZE];
+#ifdef XBOX
+    /*
+     * A second way: the entry that was last displaced from array[]. Two hot
+     * targets of indirect jumps that share a slot would otherwise evict each
+     * other on every jump and go through the hash table each time.
+     */
+    struct {
+        TranslationBlock *tb;
+        vaddr pc;
+    } victim[TB_JMP_CACHE_SIZE];
+#endif
 } CPUJumpCache;
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */

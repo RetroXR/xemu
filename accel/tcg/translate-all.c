@@ -680,5 +680,8 @@ void tcg_flush_jmp_cache(CPUState *cpu)
 
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
+#ifdef XBOX
+        qatomic_set(&jc->victim[i].tb, NULL);
+#endif
     }
 }

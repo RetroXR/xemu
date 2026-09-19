@@ -246,6 +246,20 @@ TranslationBlock *inv_tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
+static inline void tb_jmp_cache_insert(CPUJumpCache *jc, uint32_t hash,
+                                       vaddr pc, TranslationBlock *tb)
+{
+#ifdef XBOX
+    TranslationBlock *displaced = qatomic_read(&jc->array[hash].tb);
+    if (displaced && displaced != tb) {
+        jc->victim[hash].pc = jc->array[hash].pc;
+        qatomic_set(&jc->victim[hash].tb, displaced);
+    }
+#endif
+    jc->array[hash].pc = pc;
+    qatomic_set(&jc->array[hash].tb, tb);
+}
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -267,13 +281,23 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         goto hit;
     }
 
+#ifdef XBOX
+    tb = qatomic_read(&jc->victim[hash].tb);
+    if (tb &&
+        jc->victim[hash].pc == s.pc &&
+        tb->cs_base == s.cs_base &&
+        tb->flags == s.flags &&
+        tb_cflags(tb) == s.cflags) {
+        goto hit;
+    }
+#endif
+
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
     }
 
-    jc->array[hash].pc = s.pc;
-    qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_insert(jc, hash, s.pc, tb);
 
 hit:
     /*
@@ -1000,8 +1024,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
-                qatomic_set(&jc->array[h].tb, tb);
+                tb_jmp_cache_insert(jc, h, s.pc, tb);
             }
 
 #ifndef CONFIG_USER_ONLY
