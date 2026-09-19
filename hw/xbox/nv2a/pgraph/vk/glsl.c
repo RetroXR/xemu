@@ -17,7 +17,11 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
+#include "qemu/bswap.h"
+#include "qemu/fast-hash.h"
 #include "ui/xemu-settings.h"
+#include "xemu-version.h"
 #include "renderer.h"
 
 #include <assert.h>
@@ -226,6 +230,82 @@ static void add_nan_inf_preserve_execution_mode(GByteArray *spv)
     memcpy(at, capability, sizeof(capability));
 }
 
+/*
+ * Compiled shaders are kept on disk. glslang needs milliseconds for a shader
+ * on a desktop and tens of them on a phone, on the renderer thread, and a
+ * game asks for the same few hundred shaders every time it runs.
+ */
+#define SPV_CACHE_MAGIC 0x56505358 /* XSPV */
+#define SPV_MAGIC 0x07230203
+
+typedef struct SpvCacheHeader {
+    uint32_t magic;
+    uint32_t stage;
+    uint64_t source_len;
+    uint64_t source_hash;
+} SpvCacheHeader;
+
+static char *get_spv_cache_path(const SpvCacheHeader *header, bool spv15)
+{
+    if (!g_config.perf.cache_shaders ||
+        g_config.display.vulkan.debug_shaders) {
+        return NULL;
+    }
+
+    /* Whatever else decides what comes out for a given source */
+    g_autofree char *salt =
+        g_strdup_printf("%s %u %d %d", xemu_version, header->stage, spv15,
+                        preserve_nan_inf);
+    uint64_t hash = header->source_hash * 31 +
+                    fast_hash((const uint8_t *)salt, strlen(salt));
+
+    return g_strdup_printf("%s/shaders_vk/%02x/%014" PRIx64 ".spv",
+                           xemu_settings_get_base_path(),
+                           (unsigned int)(hash >> 56),
+                           hash & 0xffffffffffffffULL);
+}
+
+static GByteArray *load_spv_from_cache(const char *path,
+                                       const SpvCacheHeader *header)
+{
+    gchar *data;
+    gsize len;
+    if (!path || !g_file_get_contents(path, &data, &len, NULL)) {
+        return NULL;
+    }
+
+    size_t spv_len = len - MIN(len, sizeof(*header));
+    if (spv_len < 5 * sizeof(uint32_t) || spv_len % sizeof(uint32_t) ||
+        memcmp(data, header, sizeof(*header)) ||
+        ldl_le_p(data + sizeof(*header)) != SPV_MAGIC) {
+        g_free(data);
+        return NULL;
+    }
+
+    GByteArray *spv = g_byte_array_sized_new(spv_len);
+    g_byte_array_append(spv, (const guint8 *)data + sizeof(*header), spv_len);
+    g_free(data);
+    return spv;
+}
+
+static void save_spv_to_cache(const char *path, const SpvCacheHeader *header,
+                              const GByteArray *spv)
+{
+    if (!path) {
+        return;
+    }
+
+    g_autofree char *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0755);
+
+    GByteArray *file = g_byte_array_sized_new(sizeof(*header) + spv->len);
+    g_byte_array_append(file, (const guint8 *)header, sizeof(*header));
+    g_byte_array_append(file, spv->data, spv->len);
+    /* Replaces the file atomically */
+    g_file_set_contents(path, (const gchar *)file->data, file->len, NULL);
+    g_byte_array_unref(file);
+}
+
 GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                                           const char *glsl_source)
 {
@@ -240,6 +320,19 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
 
     /* Debugging aid: SPIR-V 1.5 has discard compile to OpKill, not demote */
     bool spv15 = getenv("XEMU_VK_SPV15") != NULL;
+
+    SpvCacheHeader cache_header = {
+        .magic = SPV_CACHE_MAGIC,
+        .stage = stage,
+        .source_len = strlen(glsl_source),
+    };
+    cache_header.source_hash =
+        fast_hash((const uint8_t *)glsl_source, cache_header.source_len);
+    g_autofree char *cache_path = get_spv_cache_path(&cache_header, spv15);
+    GByteArray *cached = load_spv_from_cache(cache_path, &cache_header);
+    if (cached) {
+        return cached;
+    }
 
     const glslang_input_t input = {
         .language = GLSLANG_SOURCE_GLSL,
@@ -343,6 +436,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     if (preserve_nan_inf) {
         add_nan_inf_preserve_execution_mode(spv);
     }
+    save_spv_to_cache(cache_path, &cache_header, spv);
     return spv;
 }
 
