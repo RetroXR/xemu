@@ -195,7 +195,12 @@ static const DisplayChangeListenerOps dcl_ops = {
 /* Sleep for most of the wait, then spin: sleeping alone is too coarse */
 static void delay_until(int64_t deadline_ns)
 {
+#ifdef _WIN32
     const int64_t spin_ns = 1500000;
+#else
+    /* Timers are fine grained here, and the core that spins is missed */
+    const int64_t spin_ns = 200000;
+#endif
 
     int64_t remaining = deadline_ns - qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     if (remaining > spin_ns) {
@@ -273,6 +278,8 @@ static void *qemu_thread_fn(void *opaque)
     static char arg0[] = "xemu";
     static char *argv[] = { arg0, NULL };
 
+    /* Lets a profiler of the frontend tell the machine's threads apart */
+    qemu_thread_naming(true);
     qemu_init(1, argv);
     qemu_main_loop();
     qatomic_set(&qemu_exiting, true);
