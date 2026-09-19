@@ -899,14 +899,82 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                           gen_helper_##lname##_xmm,                                \
                           gen_helper_##lname##_ymm);                               \
 }
+#ifdef XBOX
+/*
+ * An MMX register fits a host register, and the unpack instructions only move
+ * its elements around: a few shifts and deposits instead of a helper that
+ * copies them one at a time through memory. Video decoders (Bink) and some
+ * games use these heavily. The SSE forms still use the helpers.
+ *
+ * Both sources are read before the destination is written, which may be one
+ * of them.
+ */
+static void gen_mmx_punpck(X86DecodedInsn *decode, unsigned esz, bool high)
+{
+    unsigned n = 64 / esz;
+    TCGv_i64 v = tcg_temp_new_i64();
+    TCGv_i64 s = tcg_temp_new_i64();
+    TCGv_i64 d = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(v, tcg_env, vector_reg_offset(&decode->op[1]));
+    tcg_gen_ld_i64(s, tcg_env, vector_reg_offset(&decode->op[2]));
+
+    /* Bring the half that is interleaved down to element 0 */
+    if (high) {
+        tcg_gen_shri_i64(v, v, (n / 2) * esz);
+        tcg_gen_shri_i64(s, s, (n / 2) * esz);
+    }
+
+    /* d = v[0], s[0], v[1], s[1], ...; element 0 is in place already */
+    tcg_gen_mov_i64(d, v);
+    for (unsigned i = 0; i < n / 2; i++) {
+        if (i != 0) {
+            tcg_gen_shri_i64(t, v, i * esz);
+            tcg_gen_deposit_i64(d, d, t, 2 * i * esz, esz);
+        }
+        tcg_gen_shri_i64(t, s, i * esz);
+        tcg_gen_deposit_i64(d, d, t, (2 * i + 1) * esz, esz);
+    }
+
+    tcg_gen_st_i64(d, tcg_env, vector_reg_offset(&decode->op[0]));
+}
+
+/* As gen_binary_int_sse(), with the MMX case generated inline */
+#define BINARY_INT_MMX_PUNPCK(uname, lname, esz, high)                             \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    assert(decode->e.special == X86_SPECIAL_MMX);                                  \
+    if (!(s->prefix & PREFIX_DATA)) {                                              \
+        if (s->prefix & PREFIX_VEX) {                                              \
+            /* VEX encoding is not applicable to MMX instructions.  */             \
+            gen_illegal_opcode(s);                                                 \
+            return;                                                                \
+        }                                                                          \
+        gen_mmx_punpck(decode, esz, high);                                         \
+    } else if (!s->vex_l) {                                                        \
+        gen_helper_##lname##_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);              \
+    } else {                                                                       \
+        gen_helper_##lname##_ymm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);              \
+    }                                                                              \
+}
+
+BINARY_INT_MMX_PUNPCK(PUNPCKLBW,  punpcklbw,  8, false)
+BINARY_INT_MMX_PUNPCK(PUNPCKLWD,  punpcklwd, 16, false)
+BINARY_INT_MMX_PUNPCK(PUNPCKLDQ,  punpckldq, 32, false)
+BINARY_INT_MMX_PUNPCK(PUNPCKHBW,  punpckhbw,  8, true)
+BINARY_INT_MMX_PUNPCK(PUNPCKHWD,  punpckhwd, 16, true)
+BINARY_INT_MMX_PUNPCK(PUNPCKHDQ,  punpckhdq, 32, true)
+#else
 BINARY_INT_MMX(PUNPCKLBW,  punpcklbw)
 BINARY_INT_MMX(PUNPCKLWD,  punpcklwd)
 BINARY_INT_MMX(PUNPCKLDQ,  punpckldq)
-BINARY_INT_MMX(PACKSSWB,   packsswb)
-BINARY_INT_MMX(PACKUSWB,   packuswb)
 BINARY_INT_MMX(PUNPCKHBW,  punpckhbw)
 BINARY_INT_MMX(PUNPCKHWD,  punpckhwd)
 BINARY_INT_MMX(PUNPCKHDQ,  punpckhdq)
+#endif
+BINARY_INT_MMX(PACKSSWB,   packsswb)
+BINARY_INT_MMX(PACKUSWB,   packuswb)
 BINARY_INT_MMX(PACKSSDW,   packssdw)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
@@ -3091,8 +3159,30 @@ static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_PSHUFW(DisasContext *s, X86DecodedInsn *decode)
 {
+#ifdef XBOX
+    /*
+     * The order is an immediate, so the permutation is known now:
+     * d->W(i) = s->W((order >> 2i) & 3). See gen_mmx_punpck().
+     */
+    unsigned order = decode->immediate & 0xff;
+    TCGv_i64 src = tcg_temp_new_i64();
+    TCGv_i64 d = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(src, tcg_env, vector_reg_offset(&decode->op[1]));
+
+    /* What is left above word 0 is overwritten by the deposits */
+    tcg_gen_shri_i64(d, src, (order & 3) * 16);
+    for (unsigned i = 1; i < 4; i++) {
+        tcg_gen_shri_i64(t, src, ((order >> (2 * i)) & 3) * 16);
+        tcg_gen_deposit_i64(d, d, t, i * 16, 16);
+    }
+
+    tcg_gen_st_i64(d, tcg_env, vector_reg_offset(&decode->op[0]));
+#else
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_pshufw_mmx(OP_PTR0, OP_PTR1, imm);
+#endif
 }
 
 static void gen_PSRLW_i(DisasContext *s, X86DecodedInsn *decode)
