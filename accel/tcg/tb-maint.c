@@ -904,10 +904,21 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
+#ifdef XBOX
+        /*
+         * A TB may be at any virtual address, so its entries cannot be found,
+         * and games invalidate TBs often enough that flushing the whole cache
+         * every time leaves it mostly empty. The entries can stay: tb_lookup()
+         * compares cflags, which never match with CF_INVALID set, and the
+         * memory of a TB is not reused before tb_flush() clears the cache.
+         */
+        return;
+#else
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
             tcg_flush_jmp_cache(cpu);
         }
+#endif
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
