@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "s3tc.h"
 
 static void decode_bc1_colors(uint16_t c0, uint16_t c1, uint8_t r[4],
@@ -73,6 +74,34 @@ static void write_block_to_texture(uint8_t *converted_data, uint32_t indices,
 
     int x1 = x0 + 4,
         y1 = y0 + 4;
+
+    if (x1 <= width && y1 <= height) {
+        /*
+         * A whole block, which is nearly all of them: look the pixels up in
+         * a palette of RGBA words and store a row at a time, in place of
+         * four byte stores per pixel with bounds checks.
+         */
+        uint32_t palette[4];
+        for (int k = 0; k < 4; k++) {
+            palette[k] = cpu_to_le32(r[k] | (g[k] << 8) | (b[k] << 16) |
+                                     ((uint32_t)(separate_alpha ? 0 : a[k])
+                                      << 24));
+        }
+        for (int row = 0; row < 4; row++) {
+            uint32_t pixels[4];
+            for (int x = 0; x < 4; x++) {
+                int xy_index = 4 * row + x;
+                pixels[x] = palette[(indices >> 2 * xy_index) & 0x03];
+                if (separate_alpha) {
+                    pixels[x] |= cpu_to_le32((uint32_t)a[xy_index] << 24);
+                }
+            }
+            memcpy(converted_data +
+                       (z_pos_factor + (y0 + row) * width + x0) * 4,
+                   pixels, sizeof(pixels));
+        }
+        return;
+    }
 
     for (int y = y0; y < y1 && y < height; y++) {
         int y_index = 4 * (y - y0);
