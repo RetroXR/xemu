@@ -23,6 +23,13 @@
 
 #define RESTART " Takes effect the next time the frontend is started."
 
+/* Sinc conversion for every voice is more than a mobile SoC has to spare */
+#ifdef __ANDROID__
+#define DEFAULT_RESAMPLER "linear"
+#else
+#define DEFAULT_RESAMPLER "sinc"
+#endif
+
 static struct retro_core_option_v2_category categories[] = {
     { "system", "System", "Emulated console configuration." },
     { "video", "Video", "Renderer and picture settings." },
@@ -203,6 +210,23 @@ static struct retro_core_option_v2_definition definitions[] = {
         "audio",
         { { "enabled", NULL }, { "disabled", NULL }, { NULL, NULL } },
         "enabled",
+    },
+    {
+        "xemu_audio_resampler",
+        "Audio > Voice Resampler",
+        "Voice Resampler",
+        "How voices are converted to the output rate. Sinc sounds cleanest "
+        "and is by far the most expensive part of audio emulation; linear "
+        "interpolation costs a fraction of it and is what phones and "
+        "headsets should use.",
+        NULL,
+        "audio",
+        {
+            { "sinc", "Sinc" },
+            { "linear", "Linear" },
+            { NULL, NULL },
+        },
+        DEFAULT_RESAMPLER,
     },
     MEMORY_UNIT(1, "", "A", "top"),
     MEMORY_UNIT(1, "b", "B", "bottom"),

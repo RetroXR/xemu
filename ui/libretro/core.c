@@ -510,6 +510,15 @@ static void apply_variables(bool startup)
             CONFIG_DISPLAY_FILTERING_LINEAR;
 
     g_config.audio.hrtf = variable_is("xemu_hrtf", "enabled", true);
+#ifdef __ANDROID__
+    bool linear_default = true;
+#else
+    bool linear_default = false;
+#endif
+    g_config.audio.vp.resampler =
+        variable_is("xemu_audio_resampler", "linear", linear_default) ?
+            CONFIG_AUDIO_VP_RESAMPLER_LINEAR :
+            CONFIG_AUDIO_VP_RESAMPLER_SINC;
 
     const char *aspect = get_variable("xemu_aspect_ratio");
     int mode = !g_strcmp0(aspect, "4:3")  ? ASPECT_4_3 :

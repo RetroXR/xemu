@@ -121,7 +121,8 @@ again in the same process, so this is not a conventional core:
   White/Black, L2/R2 the triggers, Select is Back.
 - Core options (v2 with categories, v1 fallback): memory, AV pack, boot
   animation, hard FPU, hard disk location, renderer, internal resolution scale,
-  aspect ratio, output filtering, shader cache, DSP, HRTF, and a memory unit
+  aspect ratio, output filtering, shader cache, DSP, HRTF, voice resampler
+  (linear by default on Android, sinc elsewhere), and a memory unit
   for each of the two expansion slots of every port.
 - `xemu_libretro.info` in this directory is the matching core info file.
 

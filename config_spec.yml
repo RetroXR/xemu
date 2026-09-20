@@ -313,6 +313,10 @@ audio:
     num_workers:
       type: integer
       default: 0  # 0 = auto
+    resampler:
+      type: enum
+      values: [sinc, linear]
+      default: sinc
   use_dsp: bool
   use_dsp_jit:
     type: bool

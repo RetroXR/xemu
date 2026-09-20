@@ -1167,8 +1167,21 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     assert(v < MCPX_HW_MAX_VOICES);
     MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
 
+    /*
+     * The sinc converter is what costs the most in the whole APU: with the
+     * dozens of voices of a busy game it keeps several cores occupied on a
+     * mobile SoC. Linear interpolation takes a twentieth of the time.
+     */
+    int type = g_config.audio.vp.resampler == CONFIG_AUDIO_VP_RESAMPLER_LINEAR ?
+                   SRC_LINEAR : SRC_SINC_FASTEST;
+    if (filter->resampler != NULL && filter->resampler_type != type) {
+        src_delete(filter->resampler);
+        filter->resampler = NULL;
+    }
+
     if (filter->resampler == NULL) {
         filter->voice = v;
+        filter->resampler_type = type;
         int err;
 
         /* Note: Using a sinc based resampler for quality. Unsure about
@@ -1177,8 +1190,8 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
          * so use it for now.
          */
         // FIXME: Don't do 2ch resampling if this is a mono voice
-        filter->resampler = src_callback_new(&voice_resample_callback,
-                                           SRC_SINC_FASTEST, 2, &err, filter);
+        filter->resampler = src_callback_new(&voice_resample_callback, type, 2,
+                                             &err, filter);
         if (filter->resampler == NULL) {
             fprintf(stderr, "src error: %s\n", src_strerror(err));
             assert(0);
