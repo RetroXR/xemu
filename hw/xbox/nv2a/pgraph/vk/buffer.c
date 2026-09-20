@@ -187,8 +187,43 @@ void pgraph_vk_init_buffers(NV2AState *d)
         }
     }
 
+    /*
+     * Indices, inline vertices and uniforms are written to a staging buffer
+     * and copied to one in device memory by every submission. With unified
+     * memory both are the same memory, and the copy, megabytes per frame, is
+     * work for nothing: the GPU reads the staging buffer instead, as it does
+     * with the vertex RAM buffer in any case.
+     */
+    static const int staged[][2] = {
+        { BUFFER_INDEX_STAGING, BUFFER_INDEX },
+        { BUFFER_VERTEX_INLINE_STAGING, BUFFER_VERTEX_INLINE },
+        { BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM },
+    };
+    r->unified_buffers =
+        r->device_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+        !getenv("XEMU_VK_NO_UNIFIED_BUFFERS");
+    if (r->unified_buffers) {
+        for (int i = 0; i < ARRAY_SIZE(staged); i++) {
+            r->storage_buffers[staged[i][0]].usage |=
+                r->storage_buffers[staged[i][1]].usage &
+                ~VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        }
+    }
+
     for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (r->unified_buffers &&
+            (i == BUFFER_INDEX || i == BUFFER_VERTEX_INLINE ||
+             i == BUFFER_UNIFORM)) {
+            continue;
+        }
         create_buffer(pg, &r->storage_buffers[i]);
+    }
+
+    if (r->unified_buffers) {
+        for (int i = 0; i < ARRAY_SIZE(staged); i++) {
+            r->storage_buffers[staged[i][1]].buffer =
+                r->storage_buffers[staged[i][0]].buffer;
+        }
     }
 
     // FIXME: Add fallback path for device using host mapped memory
@@ -213,6 +248,11 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
     for (int i = 0; i < BUFFER_COUNT; i++) {
         if (r->storage_buffers[i].mapped) {
             vmaUnmapMemory(r->allocator, r->storage_buffers[i].allocation);
+        }
+        if (!r->storage_buffers[i].allocation) {
+            /* Stands for its staging buffer */
+            r->storage_buffers[i].buffer = VK_NULL_HANDLE;
+            continue;
         }
         destroy_buffer(pg, &r->storage_buffers[i]);
     }

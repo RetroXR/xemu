@@ -404,6 +404,8 @@ typedef struct PGRAPHVkState {
     int descriptor_set_index;
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
+    /* Draws read the staging buffers, see pgraph_vk_init_buffers() */
+    bool unified_buffers;
 
     MemorySyncRequirement vertex_ram_buffer_syncs[NV2A_VERTEXSHADER_ATTRIBUTES];
     size_t num_vertex_ram_buffer_syncs;

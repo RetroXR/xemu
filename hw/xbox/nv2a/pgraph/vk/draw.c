@@ -1239,7 +1239,8 @@ static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
     StorageBuffer *b_src = &r->storage_buffers[index_src];
     StorageBuffer *b_dst = &r->storage_buffers[index_dst];
 
-    if (b_src->buffer_offset == b_src->sync_offset) {
+    if (b_src->buffer_offset == b_src->sync_offset || r->unified_buffers) {
+        b_src->sync_offset = b_src->buffer_offset;
         if (reset) {
             b_src->buffer_offset = b_src->sync_offset = 0;
         }
