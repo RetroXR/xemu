@@ -538,6 +538,10 @@ struct CPUState {
     MemoryRegion *memory;
 
     struct CPUJumpCache *tb_jmp_cache;
+#ifdef XBOX
+    /* Where translator_touch_jmp_cache() puts what it loads */
+    uint64_t tb_jmp_cache_touch;
+#endif
 
     GArray *gdb_regs;
     int gdb_num_regs;

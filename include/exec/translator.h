@@ -169,6 +169,19 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
  */
 bool translator_io_start(DisasContextBase *db);
 
+#ifdef XBOX
+struct TCGv_i32_d;
+
+/**
+ * translator_touch_jmp_cache
+ * @pc: guest virtual address that an indirect jump will soon go to
+ *
+ * Emit a load from the entry of the jump cache that a lookup of @pc will
+ * read, to have it in the data cache by then.
+ */
+void translator_touch_jmp_cache(struct TCGv_i32_d *pc);
+#endif
+
 /*
  * Translator Load Functions
  *

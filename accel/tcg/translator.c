@@ -21,6 +21,10 @@
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#ifdef XBOX
+#include "tb-jmp-cache.h"
+#include "tb-hash.h"
+#endif
 
 static void set_can_do_io(DisasContextBase *db, bool val)
 {
@@ -28,6 +32,46 @@ static void set_can_do_io(DisasContextBase *db, bool val)
     tcg_gen_st8_i32(tcg_constant_i32(val), tcg_env,
                     offsetof(CPUState, neg.can_do_io) - sizeof(CPUState));
 }
+
+#ifdef XBOX
+/*
+ * What is left of the cost of an indirect jump, once a lookup reads a single
+ * line of the jump cache, is waiting for that line: a game has more hot
+ * return addresses than the data caches keep. A call knows the address that
+ * the matching return will look up long before it happens, and the line can
+ * be on its way while the function runs. TCG has no prefetch, and a load that
+ * goes nowhere is removed as dead code, so the value is stored where nobody
+ * reads it. An out of order CPU does not wait for either.
+ */
+void translator_touch_jmp_cache(TCGv_i32 pc)
+{
+    int shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 hash = tcg_temp_new_i32();
+    TCGv_ptr ptr = tcg_temp_new_ptr();
+    TCGv_ptr offset = tcg_temp_new_ptr();
+    TCGv_i64 val = tcg_temp_new_i64();
+
+    /* tb_jmp_cache_hash_func() */
+    tcg_gen_shri_i32(tmp, pc, shift);
+    tcg_gen_xor_i32(tmp, tmp, pc);
+    tcg_gen_shri_i32(hash, tmp, shift);
+    tcg_gen_andi_i32(hash, hash, TB_JMP_PAGE_MASK);
+    tcg_gen_andi_i32(tmp, tmp, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i32(hash, hash, tmp);
+
+    QEMU_BUILD_BUG_ON(sizeof_field(CPUJumpCache, array[0]) != 64);
+    tcg_gen_shli_i32(hash, hash, 6);
+    tcg_gen_ext_i32_ptr(offset, hash);
+
+    tcg_gen_ld_ptr(ptr, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    tcg_gen_add_ptr(ptr, ptr, offset);
+    tcg_gen_ld_i64(val, ptr, offsetof(CPUJumpCache, array));
+    tcg_gen_st_i64(val, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache_touch) - sizeof(CPUState));
+}
+#endif
 
 bool translator_io_start(DisasContextBase *db)
 {

@@ -1640,15 +1640,36 @@ static void gen_BZHI(DisasContext *s, X86DecodedInsn *decode)
     prepare_update2_cc(decode, s, CC_OP_BMILGB + ot);
 }
 
+#if defined(XBOX) && defined(CONFIG_SYSTEM_ONLY) && !defined(TARGET_X86_64)
+/* The return will look this address up, see translator_touch_jmp_cache() */
+static void gen_xbox_call_return_address(DisasContext *s, TCGv eip_next)
+{
+    if (!CODE64(s)) {
+        TCGv pc = tcg_temp_new();
+
+        tcg_gen_add_tl(pc, eip_next, cpu_seg_base[R_CS]);
+        translator_touch_jmp_cache(pc);
+    }
+}
+#else
+#define gen_xbox_call_return_address(s, eip_next)
+#endif
+
 static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 {
-    gen_push_v(s, eip_next_tl(s));
+    TCGv eip_next = eip_next_tl(s);
+
+    gen_push_v(s, eip_next);
+    gen_xbox_call_return_address(s, eip_next);
     gen_JMP(s, decode);
 }
 
 static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
 {
-    gen_push_v(s, eip_next_tl(s));
+    TCGv eip_next = eip_next_tl(s);
+
+    gen_push_v(s, eip_next);
+    gen_xbox_call_return_address(s, eip_next);
     gen_JMP_m(s, decode);
 }
 
