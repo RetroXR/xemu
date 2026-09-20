@@ -533,7 +533,11 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
     static unsigned debug_count;
     const char *path = "none";
     bool ok = false;
+    /* Whether frame_buf still holds what the last readback put there */
+    static bool readback_in_frame_buf;
+    static unsigned readback_width, readback_height;
 
+    frame->duplicate = false;
     int tex = nv2a_get_framebuffer_surface();
     if (tex) {
 #ifdef CONFIG_OPENGL
@@ -545,8 +549,38 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
         const uint8_t *pixels =
             nv2a_get_framebuffer_pixels(&width, &height, &stride);
         if (pixels) {
+            /*
+             * A game that draws 30 frames a second has the same image shown
+             * twice, and the frontend can do without the second one. What
+             * becomes of the pixels on the way counts too: games fade with
+             * the gamma ramp.
+             */
+            static unsigned int last_serial;
+            static bool last_screen_off;
+            static uint8_t last_palette[256 * 3];
+            unsigned int serial = nv2a_get_framebuffer_serial();
+            bool screen_off = nv2a_get_screen_off();
+            const uint8_t *palette = nv2a_get_dac_palette();
+            frame->duplicate =
+                readback_in_frame_buf && serial == last_serial &&
+                screen_off == last_screen_off &&
+                !memcmp(palette, last_palette, sizeof(last_palette));
+            last_serial = serial;
+            last_screen_off = screen_off;
+            memcpy(last_palette, palette, sizeof(last_palette));
+        }
+        if (pixels && frame->duplicate) {
+            frame->width = readback_width;
+            frame->height = readback_height;
+            frame->widescreen = height / surface_scale >= 720;
+            path = "readback (same)";
+            ok = true;
+        } else if (pixels) {
             /* The display image is composed upside down, for GL's benefit */
             copy_xrgb8888(pixels, width, height, stride, true, frame);
+            readback_width = frame->width;
+            readback_height = frame->height;
+            readback_in_frame_buf = true;
             frame->widescreen = height / surface_scale >= 720;
             path = "readback";
             ok = true;
@@ -556,6 +590,7 @@ bool xemu_libretro_video_render(XemuLibretroFrame *frame)
 
     if (!ok) {
         /* The guest is not rendering with the GPU */
+        readback_in_frame_buf = false;
         ok = copy_vga_surface(frame);
         path = "vga";
     }

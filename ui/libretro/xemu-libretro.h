@@ -78,6 +78,7 @@ typedef struct XemuLibretroFrame {
     unsigned width, height;
     size_t pitch;
     bool widescreen;
+    bool duplicate; /* Same as the frame before */
 } XemuLibretroFrame;
 
 struct DisplaySurface;

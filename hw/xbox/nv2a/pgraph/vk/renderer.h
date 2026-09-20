@@ -294,6 +294,9 @@ typedef struct PGRAPHVkDisplayState {
 
     int width, height;
     int draw_time;
+    bool composed; /* The image shows composed_addr as of draw_time */
+    hwaddr composed_addr;
+    int composed_line_offset;
 
 #if HAVE_EXTERNAL_MEMORY
     // OpenGL Interop

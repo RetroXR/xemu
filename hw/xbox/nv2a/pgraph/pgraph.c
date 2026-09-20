@@ -393,6 +393,12 @@ const uint8_t *nv2a_get_framebuffer_pixels(int *width, int *height,
     return pg->renderer->ops.get_framebuffer_pixels(d, width, height, stride);
 }
 
+unsigned int nv2a_get_framebuffer_serial(void)
+{
+    assert(g_nv2a->pgraph.framebuffer_in_use);
+    return g_nv2a->pgraph.framebuffer_serial;
+}
+
 void nv2a_release_framebuffer_surface(void)
 {
     NV2AState *d = g_nv2a;

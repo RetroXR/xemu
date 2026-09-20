@@ -1395,7 +1395,11 @@ RETRO_API void retro_run(void)
             fill_geometry(&geom);
             environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
         }
-        video_cb(f.data, f.width, f.height, f.pitch);
+        if (f.duplicate && can_dupe) {
+            video_cb(NULL, f.width, f.height, 0);
+        } else {
+            video_cb(f.data, f.width, f.height, f.pitch);
+        }
     } else if (can_dupe) {
         video_cb(NULL, geom_width, geom_height, 0);
     } else {

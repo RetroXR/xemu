@@ -260,6 +260,7 @@ typedef struct PGRAPHState {
     QemuEvent sync_complete;
 
     bool framebuffer_in_use;
+    unsigned int framebuffer_serial; /* Counts the display images composed */
     QemuCond framebuffer_released;
 
     enum {

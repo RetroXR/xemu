@@ -579,6 +579,7 @@ static void destroy_current_display_image(PGRAPHState *pg)
     d->memory = VK_NULL_HANDLE;
 
     d->draw_time = 0;
+    d->composed = false;
 }
 
 // FIXME: We may need to use two images. One for actually rendering display,
@@ -1064,6 +1065,9 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
 #endif
 
     disp->draw_time = surface->draw_time;
+    disp->composed = true;
+    disp->composed_addr = surface->vram_addr;
+    pg->framebuffer_serial++;
 }
 
 static void create_surface_sampler(PGRAPHState *pg)
@@ -1173,6 +1177,25 @@ void pgraph_vk_render_display(PGRAPHState *pg)
     if (!disp->image || disp->width != width || disp->height != height) {
         create_display_image(pg, width, height);
     }
+
+    /*
+     * The display is asked for at the rate of the screen, and a game that
+     * draws every other or every third frame of that has nothing new to show
+     * most of the time. Composing the image anyway is a submission that is
+     * waited for, and a readback, in the middle of the frame being drawn.
+     */
+    bool pvideo = (d->pvideo.regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE) ||
+                  disp->pvideo.state.enabled;
+#if !HAVE_EXTERNAL_MEMORY
+    disp->composed &= disp->readback_valid;
+#endif
+    if (disp->composed && !pvideo && !surface->upload_pending &&
+        disp->composed_addr == surface->vram_addr &&
+        disp->draw_time == surface->draw_time &&
+        disp->composed_line_offset == vga_display_params.line_offset) {
+        return;
+    }
+    disp->composed_line_offset = vga_display_params.line_offset;
 
     render_display(pg, surface);
 }

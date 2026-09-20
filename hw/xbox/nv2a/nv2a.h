@@ -31,6 +31,8 @@ int nv2a_get_framebuffer_surface(void);
  */
 const uint8_t *nv2a_get_framebuffer_pixels(int *width, int *height,
                                            int *stride);
+/* Changes when the pixels do, under the same conditions */
+unsigned int nv2a_get_framebuffer_serial(void);
 void nv2a_release_framebuffer_surface(void);
 void nv2a_set_surface_scale_factor(unsigned int scale);
 unsigned int nv2a_get_surface_scale_factor(void);
