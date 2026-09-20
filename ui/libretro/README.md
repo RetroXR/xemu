@@ -88,7 +88,9 @@ again in the same process, so this is not a conventional core:
   standalone xemu. `retro_run()` fetches the most recent frame, takes one video
   frame worth of audio out of the APU's output queue and forwards input. The
   APU throttles on that queue, as it does on a sound card's. There are no save
-  states, no rewind, no run-ahead and no fast-forward.
+  states, no rewind, no run-ahead and no fast-forward. A frontend that answers
+  `GET_CAN_DUPE` is given a `NULL` frame when the picture is the one it
+  already has, which is every other frame of a game that draws 30 a second.
 - All calls into QEMU are made from a "core thread" that plays the part of
   the main thread of `ui/xemu.c`. The frontend's thread only talks to it
   through the mailboxes in `core.c`, `input.c` and `audio.c`.
@@ -130,4 +132,6 @@ Set `XEMU_LIBRETRO_LOG=<file>` to send the core's stdout/stderr (QEMU's own
 messages do not go through the frontend's log interface) to a file, and
 `XEMU_LIBRETRO_DEBUG=1` for periodic notes about the video path and the
 renderer's counters. `XEMU_LIBRETRO_TRACE=<pattern>[,<pattern>...]` enables
-QEMU trace events, e.g. `usb_msd_*,usb_desc_*` to watch a memory unit.
+QEMU trace events, e.g. `usb_msd_*,usb_desc_*` to watch a memory unit. Use
+patterns with a wildcard, the name of a single event has been seen to enable
+nothing, and set `XEMU_LIBRETRO_LOG` as well where the frontend has no console.
