@@ -903,22 +903,44 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
 
-    if (tb_cflags(tb) & CF_PCREL) {
 #ifdef XBOX
-        /*
-         * A TB may be at any virtual address, so its entries cannot be found,
-         * and games invalidate TBs often enough that flushing the whole cache
-         * every time leaves it mostly empty. The entries can stay: tb_lookup()
-         * compares cflags, which never match with CF_INVALID set, and the
-         * memory of a TB is not reused before tb_flush() clears the cache.
-         */
+    /*
+     * A TB may be at any virtual address with CF_PCREL, and games invalidate
+     * TBs often enough that flushing the whole cache every time leaves it
+     * mostly empty. The TB knows where it was entered instead, and nothing
+     * enters it any more with CF_INVALID set, see tb_jmp_cache_insert().
+     */
+    uint32_t hash[ARRAY_SIZE(tb->jc_hash)];
+    uint32_t count;
+
+    qemu_spin_lock(&tb->jmp_lock);
+    count = tb->jc_count;
+    memcpy(hash, tb->jc_hash, sizeof(hash));
+    qemu_spin_unlock(&tb->jmp_lock);
+
+    if (count > ARRAY_SIZE(hash)) {
+        CPU_FOREACH(cpu) {
+            tcg_flush_jmp_cache(cpu);
+        }
         return;
+    }
+    CPU_FOREACH(cpu) {
+        CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+        for (uint32_t i = 0; i < count; i++) {
+            for (int w = 0; w < 2; w++) {
+                if (qatomic_read(&jc->array[hash[i]].way[w].tb) == tb) {
+                    qatomic_set(&jc->array[hash[i]].way[w].tb, NULL);
+                }
+            }
+        }
+    }
 #else
+    if (tb_cflags(tb) & CF_PCREL) {
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
             tcg_flush_jmp_cache(cpu);
         }
-#endif
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
@@ -928,13 +950,9 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
             if (qatomic_read(&jc->array[h].tb) == tb) {
                 qatomic_set(&jc->array[h].tb, NULL);
             }
-#ifdef XBOX
-            if (qatomic_read(&jc->victim[h].tb) == tb) {
-                qatomic_set(&jc->victim[h].tb, NULL);
-            }
-#endif
         }
     }
+#endif
 }
 
 /*

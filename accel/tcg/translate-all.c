@@ -514,6 +514,9 @@ recycle_tb:
     tb->jmp_list_next[1] = (uintptr_t)NULL;
     tb->jmp_dest[0] = (uintptr_t)NULL;
     tb->jmp_dest[1] = (uintptr_t)NULL;
+#ifdef XBOX
+    tb->jc_count = 0;
+#endif
 
     /* init original jump addresses which have been set during tcg_gen_code() */
     if (tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID) {
@@ -679,9 +682,11 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     }
 
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
 #ifdef XBOX
-        qatomic_set(&jc->victim[i].tb, NULL);
+        qatomic_set(&jc->array[i].way[0].tb, NULL);
+        qatomic_set(&jc->array[i].way[1].tb, NULL);
+#else
+        qatomic_set(&jc->array[i].tb, NULL);
 #endif
     }
 }

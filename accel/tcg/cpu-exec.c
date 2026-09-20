@@ -34,6 +34,9 @@
 #include "tcg/tcg.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
+#ifdef XBOX
+#include "qemu/memalign.h"
+#endif
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "exec/icount.h"
@@ -246,18 +249,95 @@ TranslationBlock *inv_tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
+#ifdef XBOX
+/* The keys hold 32 bits of each, which is all an Xbox has */
+static inline bool tb_jmp_cache_keys(TCGTBCPUState s, uint64_t key[2])
+{
+    key[0] = (uint64_t)s.cs_base << 32 | (uint32_t)s.pc;
+    key[1] = (uint64_t)s.cflags << 32 | s.flags;
+    return likely(!((s.pc | s.cs_base) >> 32));
+}
+
+static inline CPUJumpCacheWay *tb_jmp_cache_find(CPUState *cpu,
+                                                 TCGTBCPUState s)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t hash = tb_jmp_cache_hash_func(s.pc);
+    uint64_t key[2];
+
+    if (!tb_jmp_cache_keys(s, key)) {
+        return NULL;
+    }
+    for (int w = 0; w < 2; w++) {
+        CPUJumpCacheWay *way = &jc->array[hash].way[w];
+
+        if (way->key[0] == key[0] && way->key[1] == key[1] &&
+            qatomic_read(&way->tb)) {
+            return way;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Entering a TB and invalidating it exclude each other with the jmp_lock of
+ * the TB, as chaining to it and invalidating it do: either the TB is found
+ * invalid here, or tb_jmp_cache_inval_tb() finds what was entered here.
+ */
+static bool tb_jmp_cache_set_way(CPUJumpCacheWay *way, uint32_t hash,
+                                 const uint64_t key[2], TranslationBlock *tb)
+{
+    bool valid;
+
+    qemu_spin_lock(&tb->jmp_lock);
+    valid = !(tb->cflags & CF_INVALID);
+    if (valid) {
+        uint32_t i;
+
+        for (i = 0; i < MIN(tb->jc_count, ARRAY_SIZE(tb->jc_hash)); i++) {
+            if (tb->jc_hash[i] == hash) {
+                break;
+            }
+        }
+        if (i == tb->jc_count) {
+            if (i < ARRAY_SIZE(tb->jc_hash)) {
+                tb->jc_hash[i] = hash;
+            }
+            tb->jc_count++;
+        }
+
+        way->key[0] = key[0];
+        way->key[1] = key[1];
+        way->tc_ptr = tb->tc.ptr;
+        qatomic_set(&way->tb, tb);
+    } else {
+        qatomic_set(&way->tb, NULL);
+    }
+    qemu_spin_unlock(&tb->jmp_lock);
+    return valid;
+}
+#endif
+
 static inline void tb_jmp_cache_insert(CPUJumpCache *jc, uint32_t hash,
-                                       vaddr pc, TranslationBlock *tb)
+                                       TCGTBCPUState s, TranslationBlock *tb)
 {
 #ifdef XBOX
-    TranslationBlock *displaced = qatomic_read(&jc->array[hash].tb);
-    if (displaced && displaced != tb) {
-        jc->victim[hash].pc = jc->array[hash].pc;
-        qatomic_set(&jc->victim[hash].tb, displaced);
+    CPUJumpCacheWay *way = jc->array[hash].way;
+    uint64_t key[2];
+
+    if (!tb_jmp_cache_keys(s, key)) {
+        return;
     }
-#endif
-    jc->array[hash].pc = pc;
+
+    TranslationBlock *displaced = qatomic_read(&way[0].tb);
+    if (displaced && displaced != tb) {
+        tb_jmp_cache_set_way(&way[1], hash, way[0].key, displaced);
+    }
+    tb_jmp_cache_set_way(&way[0], hash, key, tb);
+#else
+    jc->array[hash].pc = s.pc;
     qatomic_set(&jc->array[hash].tb, tb);
+#endif
 }
 
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
@@ -272,22 +352,21 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
 
+#ifdef XBOX
+    CPUJumpCacheWay *way = tb_jmp_cache_find(cpu, s);
+    if (likely(way)) {
+        tb = qatomic_read(&way->tb);
+        if (likely(tb)) {
+            return tb;
+        }
+    }
+#else
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
-        goto hit;
-    }
-
-#ifdef XBOX
-    tb = qatomic_read(&jc->victim[hash].tb);
-    if (tb &&
-        jc->victim[hash].pc == s.pc &&
-        tb->cs_base == s.cs_base &&
-        tb->flags == s.flags &&
-        tb_cflags(tb) == s.cflags) {
         goto hit;
     }
 #endif
@@ -297,9 +376,11 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
 
-    tb_jmp_cache_insert(jc, hash, s.pc, tb);
+    tb_jmp_cache_insert(jc, hash, s, tb);
 
+#ifndef XBOX
 hit:
+#endif
     /*
      * As long as tb is not NULL, the contents are consistent.  Therefore,
      * the virtual PC has to match for non-CF_PCREL translations.
@@ -437,6 +518,16 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
         cpu_loop_exit(cpu);
     }
+
+#ifdef XBOX
+    /* The way here most of the time, without a look at the TB */
+    if (!qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        CPUJumpCacheWay *way = tb_jmp_cache_find(cpu, s);
+        if (likely(way)) {
+            return way->tc_ptr;
+        }
+    }
+#endif
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
@@ -1024,7 +1115,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                tb_jmp_cache_insert(jc, h, s.pc, tb);
+                tb_jmp_cache_insert(jc, h, s, tb);
             }
 
 #ifndef CONFIG_USER_ONLY
@@ -1112,7 +1203,13 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         tcg_target_initialized = true;
     }
 
+#ifdef XBOX
+    cpu->tb_jmp_cache = qemu_memalign(__alignof__(CPUJumpCache),
+                                      sizeof(CPUJumpCache));
+    memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
+#else
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+#endif
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
@@ -1122,6 +1219,13 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     return true;
 }
 
+#ifdef XBOX
+static void tb_jmp_cache_free(CPUJumpCache *jc)
+{
+    qemu_vfree(jc);
+}
+#endif
+
 /* undo the initializations in reverse order */
 void tcg_exec_unrealizefn(CPUState *cpu)
 {
@@ -1130,5 +1234,9 @@ void tcg_exec_unrealizefn(CPUState *cpu)
 #endif /* !CONFIG_USER_ONLY */
 
     tlb_destroy(cpu);
+#ifdef XBOX
+    call_rcu(cpu->tb_jmp_cache, tb_jmp_cache_free, rcu);
+#else
     g_free_rcu(cpu->tb_jmp_cache, rcu);
+#endif
 }

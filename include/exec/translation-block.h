@@ -145,6 +145,15 @@ struct TranslationBlock {
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
     uintptr_t jmp_dest[2];
+
+#ifdef XBOX
+    /*
+     * Where in the jump caches this TB was entered, under jmp_lock. With more
+     * places than there is room for, the count is larger than the array.
+     */
+    uint32_t jc_hash[2];
+    uint32_t jc_count;
+#endif
 };
 
 /* The alignment given to TranslationBlock during allocation. */

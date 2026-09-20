@@ -157,9 +157,11 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 
     i0 = tb_jmp_cache_hash_page(page_addr);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
 #ifdef XBOX
-        qatomic_set(&jc->victim[i0 + i].tb, NULL);
+        qatomic_set(&jc->array[i0 + i].way[0].tb, NULL);
+        qatomic_set(&jc->array[i0 + i].way[1].tb, NULL);
+#else
+        qatomic_set(&jc->array[i0 + i].tb, NULL);
 #endif
     }
 }
