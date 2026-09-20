@@ -262,7 +262,7 @@ static char *get_spv_cache_path(const SpvCacheHeader *header, bool spv15)
     return g_strdup_printf("%s/shaders_vk/%02x/%014" PRIx64 ".spv",
                            xemu_settings_get_base_path(),
                            (unsigned int)(hash >> 56),
-                           hash & 0xffffffffffffffULL);
+                           (uint64_t)(hash & 0xffffffffffffffULL));
 }
 
 static GByteArray *load_spv_from_cache(const char *path,
