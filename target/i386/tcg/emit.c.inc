@@ -2119,6 +2119,18 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 #endif
 }
 
+#ifdef XBOX
+/* A nop unless the Xbox kernel has nothing to do, see decode_90() */
+static void gen_XBOX_IDLE(DisasContext *s, X86DecodedInsn *decode)
+{
+#ifdef CONFIG_SYSTEM_ONLY
+    gen_update_cc_op(s);
+    gen_update_eip_next(s);
+    gen_helper_xbox_idle(tcg_env);
+#endif
+}
+#endif
+
 static void gen_IDIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
@@ -2365,6 +2377,43 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
 
     gen_bnd_jmp(s);
     gen_jcc(s, decode->b & 0xf, taken);
+
+#if defined(XBOX) && defined(CONFIG_SYSTEM_ONLY)
+    /*
+     * A short jump backwards may close the loop of a spinning wait, see
+     * helper_xbox_spin(). The helper is only called when the registers, by
+     * their XOR, look the same as the last time round, so that a loop that
+     * works on something, advancing a pointer or a count, pays a few
+     * instructions. A block that loops to its own start without reading
+     * memory cannot be waiting for anything: that is a delay loop, which is
+     * too tight even for that.
+     */
+    target_ulong spin_target = s->pc + (target_long)decode->immediate;
+    if (spin_target < s->pc && s->pc - spin_target <= 64 &&
+        !((spin_target ^ s->pc) & TARGET_PAGE_MASK) &&
+        (s->tb_loads || spin_target != s->base.pc_first)) {
+        gen_jmp_rel_csize(s, 0, 1);
+
+        gen_set_label(taken);
+        TCGLabel *changed = gen_new_label();
+        TCGv signature = tcg_temp_new();
+        TCGv last = tcg_temp_new();
+        tcg_gen_xor_tl(signature, cpu_regs[0], cpu_regs[1]);
+        for (int i = 2; i < CPU_NB_REGS; i++) {
+            tcg_gen_xor_tl(signature, signature, cpu_regs[i]);
+        }
+        tcg_gen_ld_tl(last, tcg_env,
+                      offsetof(CPUX86State, xbox_spin_signature));
+        tcg_gen_st_tl(signature, tcg_env,
+                      offsetof(CPUX86State, xbox_spin_signature));
+        tcg_gen_brcond_tl(TCG_COND_NE, signature, last, changed);
+        gen_helper_xbox_spin(tcg_env);
+        gen_set_label(changed);
+        gen_jmp_rel(s, s->dflag, decode->immediate, 0);
+        return;
+    }
+#endif
+
     gen_conditional_jump_labels(s, decode->immediate, NULL, taken);
 }
 

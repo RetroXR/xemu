@@ -521,6 +521,70 @@ G_NORETURN void helper_hlt(CPUX86State *env)
     cpu_loop_exit(cs);
 }
 
+#ifdef XBOX
+/*
+ * In place of the first nop of the interrupt window in the kernel's idle
+ * loop, see decode_90(). The loop only gets here again after it has found,
+ * with interrupts off, that there is no DPC to run and no thread to switch to,
+ * but it is entered from elsewhere, during startup before any interrupt is set
+ * up, with a thread waiting. So look at what the loop is about to look at, and
+ * only when there is nothing to do wait for the interrupt that will change
+ * that. Interrupts are on and this instruction is in the shadow of the sti,
+ * so none can get in between the check and the halt.
+ */
+void helper_xbox_idle(CPUX86State *env)
+{
+    uint32_t dpc_list_head = env->regs[R_EBP];
+    uint32_t prcb = env->regs[R_EBX];
+    if (!(env->eflags & IF_MASK) ||
+        cpu_ldl_data_ra(env, dpc_list_head, GETPC()) != dpc_list_head ||
+        cpu_ldl_data_ra(env, prcb + 0x2c, GETPC()) != 0) {
+        return;
+    }
+
+    helper_hlt(env);
+}
+
+/*
+ * Called when a short block of code jumps back to its own start, see
+ * gen_Jcc(). Xbox software waits by spinning: Direct3D, for the GPU to catch
+ * up or for the flip, goes round
+ *
+ *     mov ecx, [edx]; mov edi, esi; sub edi, ecx; cmp eax, edi; jb ...
+ *
+ * and a game that is limited by the GPU or by vsync spends most of its time
+ * there, as does the host core that runs it. When the registers come round
+ * unchanged again and again, nothing the loop does can end it: it waits for
+ * memory to be written by a device or by an interrupt handler. Then the wait
+ * might as well be a short sleep on the host. A loop that counts, a delay
+ * loop in particular, changes a register on each pass and is left alone.
+ */
+#define XBOX_SPIN_THRESHOLD 1000
+#define XBOX_SPIN_SLEEP_US 100
+
+void helper_xbox_spin(CPUX86State *env)
+{
+    static target_ulong last_regs[CPU_NB_REGS];
+    static unsigned passes;
+
+    if (memcmp(last_regs, env->regs, sizeof(last_regs))) {
+        memcpy(last_regs, env->regs, sizeof(last_regs));
+        passes = 0;
+        return;
+    }
+
+    if (++passes < XBOX_SPIN_THRESHOLD) {
+        return;
+    }
+    passes = XBOX_SPIN_THRESHOLD;
+
+    /* An interrupt that is waiting may be what ends the loop */
+    if (!qatomic_read(&env_cpu(env)->interrupt_request)) {
+        g_usleep(XBOX_SPIN_SLEEP_US);
+    }
+}
+#endif
+
 void helper_monitor(CPUX86State *env, target_ulong ptr)
 {
     if ((uint32_t)env->regs[R_ECX] != 0) {

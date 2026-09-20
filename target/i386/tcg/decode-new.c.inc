@@ -1574,6 +1574,41 @@ static void decode_90(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint
     } else {
         *entry = (s->prefix & PREFIX_REPZ) ? pause : nop;
     }
+
+#ifdef XBOX
+    /*
+     * The idle loop of the Xbox kernel does not halt. It opens a window for
+     * interrupts and then looks, with interrupts off, for a DPC to run and a
+     * thread to switch to, forever:
+     *
+     *     sti; nop; nop; cli
+     *     cmp ebp, [ebp]; je +12         ; DPC list empty?
+     *     mov cl, 2; call ...; call ...  ; no: retire the DPCs
+     *     cmp dword [ebx + 0x2c], 0      ; next thread?
+     *     je  back to the sti
+     *
+     * which keeps a host core busy whatever the game does. The first nop, the
+     * instruction in the interrupt shadow of the sti, is made to wait for an
+     * interrupt when there is nothing to do, as "sti; hlt" would.
+     */
+    static const int16_t idle_loop[] = {
+        0x90, 0xfa, 0x3b, 0x6d, 0x00, 0x74, 0x0c, 0xb1, 0x02,
+        0xe8, -1, -1, -1, -1, 0xe8, -1, -1, -1, -1,
+        0x83, 0x7b, 0x2c, 0x00, 0x74, 0xe5,
+    };
+    if (!s->prefix && CPL(s) == 0 && (s->flags & HF_INHIBIT_IRQ_MASK) &&
+        !((s->pc ^ (s->pc + ARRAY_SIZE(idle_loop))) & TARGET_PAGE_MASK)) {
+        bool match = true;
+        for (int i = 0; match && i < ARRAY_SIZE(idle_loop); i++) {
+            match = idle_loop[i] < 0 ||
+                    translator_ldub(env, &s->base, s->pc + i) == idle_loop[i];
+        }
+        if (match) {
+            static X86OpEntry idle = X86_OP_ENTRY0(XBOX_IDLE, chk(cpl0));
+            *entry = idle;
+        }
+    }
+#endif
 }
 
 static const X86OpEntry opcodes_root[256] = {

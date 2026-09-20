@@ -212,6 +212,9 @@ typedef struct DisasContext {
 #endif
     bool vex_w; /* used by AVX even on 32-bit processors */
     bool jmp_opt; /* use direct block chaining for direct jumps */
+#ifdef XBOX
+    bool tb_loads; /* the TB reads guest memory, see gen_Jcc() */
+#endif
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
@@ -629,6 +632,9 @@ void gen_op_add_reg_im(DisasContext *s, MemOp size, int reg, int32_t val)
 
 static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
+#ifdef XBOX
+    s->tb_loads = true;
+#endif
     tcg_gen_qemu_ld_tl(t0, a0, s->mem_index, idx | MO_LE);
 }
 
@@ -4274,6 +4280,9 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+#ifdef XBOX
+    dc->tb_loads = false;
+#endif
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
     dc->cpuid_features = env->features[FEAT_1_EDX];

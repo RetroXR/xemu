@@ -2062,6 +2062,10 @@ typedef struct CPUArchState {
     uint64_t msr_pkg_energy_status;
 
     /* Fields up to this point are cleared by a CPU reset */
+#ifdef XBOX
+    /* XOR of the registers the last time round a loop, see gen_Jcc() */
+    target_ulong xbox_spin_signature;
+#endif
     struct {} end_reset_fields;
 
     /* Fields after this point are preserved across CPU reset. */
