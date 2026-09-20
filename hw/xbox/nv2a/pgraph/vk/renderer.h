@@ -216,6 +216,7 @@ typedef struct TextureKey {
     uint32_t address;
     uint32_t border_color;
     uint32_t max_anisotropy;
+    bool native_s3tc; /* The image has the compressed format of the texture */
 } TextureKey;
 
 typedef struct TextureBinding {

@@ -97,6 +97,46 @@ static void memcpy_image(void *dst, void *src, int min_stride, int dst_stride, i
     }
 }
 
+/*
+ * S3TC textures are decompressed for the GPU unless it takes them as they
+ * are, which leaves it with a fourth to an eighth of the memory to keep and
+ * to read from, and the CPU with nothing to do but copy. Left out is what a
+ * compressed image is not used for here: 3D textures, textures with a border,
+ * and being the destination of a copy from a surface.
+ */
+static bool use_native_s3tc(PGRAPHState *pg, const TextureShape *s,
+                            bool surface_to_texture)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    static int disabled = -1;
+
+    if (disabled < 0) {
+        disabled = getenv("XEMU_VK_NO_NATIVE_S3TC") != NULL;
+    }
+
+    return !disabled && !surface_to_texture &&
+           r->enabled_physical_device_features.textureCompressionBC &&
+           pgraph_is_texture_format_compressed(pg, s->color_format) &&
+           s->dimensionality == 2 && !s->border;
+}
+
+static VkColorFormatInfo get_texture_vk_format(const TextureKey *key)
+{
+    if (key->native_s3tc) {
+        switch (key->state.color_format) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5:
+            return (VkColorFormatInfo){ VK_FORMAT_BC1_RGBA_UNORM_BLOCK };
+        case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8:
+            return (VkColorFormatInfo){ VK_FORMAT_BC2_UNORM_BLOCK };
+        case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8:
+            return (VkColorFormatInfo){ VK_FORMAT_BC3_UNORM_BLOCK };
+        default:
+            assert(!"Not a compressed format");
+        }
+    }
+    return kelvin_color_format_vk_map[key->state.color_format];
+}
+
 // FIXME: Move to common
 static size_t get_cubemap_layer_size(PGRAPHState *pg, TextureShape s)
 {
@@ -138,7 +178,8 @@ static size_t get_cubemap_layer_size(PGRAPHState *pg, TextureShape s)
 // FIXME: More refactoring
 // FIXME: Possible parallelization of decoding
 // FIXME: Bounds checking
-static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
+static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx,
+                                         bool native_s3tc)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     TextureShape s = pgraph_get_texture_shape(pg, texture_idx);
@@ -247,10 +288,18 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                     unsigned int physical_width = (width + 3) & ~3,
                                  physical_height = (height + 3) & ~3;
 
-                    size_t converted_size = width * height * 4;
-                    uint8_t *converted = s3tc_decompress_2d(
-                        kelvin_format_to_s3tc_format(s.color_format),
-                        texture_data_ptr, width, height);
+                    size_t converted_size;
+                    uint8_t *converted;
+                    if (native_s3tc) {
+                        converted_size = physical_width / 4 *
+                                         physical_height / 4 * block_size;
+                        converted = g_memdup2(texture_data_ptr, converted_size);
+                    } else {
+                        converted_size = width * height * 4;
+                        converted = s3tc_decompress_2d(
+                            kelvin_format_to_s3tc_format(s.color_format),
+                            texture_data_ptr, width, height);
+                    }
                     assert(converted);
 
                     if (s.cubemap && adjusted_width != s.width) {
@@ -480,11 +529,12 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     TextureShape *state = &binding->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = get_texture_vk_format(&binding->key);
 
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
-    g_autofree TextureLayout *layout = get_texture_layout(pg, texture_idx);
+    g_autofree TextureLayout *layout =
+        get_texture_layout(pg, texture_idx, binding->key.native_s3tc);
     const int num_layers = state->cubemap ? 6 : 1;
 
     // Calculate decoded texture data size
@@ -1271,6 +1321,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     if (surface_to_texture && pg->surface_scale_factor > 1) {
         key.scale = pg->surface_scale_factor;
     }
+    key.native_s3tc = use_native_s3tc(pg, &state, surface_to_texture);
 
     uint64_t key_hash = fast_hash((void*)&key, sizeof(key));
     LruNode *node = lru_lookup(&r->texture_cache, key_hash, &key);
@@ -1328,7 +1379,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->possibly_dirty = false;
     snode->hash = content_hash;
 
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
+    VkColorFormatInfo vkf = get_texture_vk_format(&key);
     assert(vkf.vk_format != 0);
     assert(0 < state.dimensionality);
     assert(state.dimensionality < ARRAY_SIZE(dimensionality_to_vk_image_type));
