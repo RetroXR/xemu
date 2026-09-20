@@ -4681,6 +4681,12 @@ foreach target : target_dirs
     endif
 
     if exe.get('libretro', false)
+      # Nothing outside gets to replace a function of the core, and without
+      # this every call between source files goes through the PLT on ELF
+      libretro_link_args = []
+      if host_os not in ['windows', 'darwin']
+        libretro_link_args = cc.get_supported_link_arguments('-Wl,-Bsymbolic')
+      endif
       emulator = shared_module('xemu_libretro' + (host_is_android ? '_android' : ''),
                  exe['sources'],
                  name_prefix: '',
@@ -4689,7 +4695,7 @@ foreach target : target_dirs
                  dependencies: arch_deps + exe['dependencies'],
                  objects: lib.extract_all_objects(recursive: true),
                  link_depends: [block_syms, qemu_syms],
-                 link_args: link_args)
+                 link_args: link_args + libretro_link_args)
     else
       emulator = executable(exe_name, exe['sources'],
                  install: true,
