@@ -1901,6 +1901,17 @@ typedef struct CPUArchState {
     /* emulator internal variables */
     float_status fp_status;
     floatx80 ft0;
+#if defined(XBOX) && defined(__aarch64__)
+    /*
+     * x87 registers, by index into fpregs[] with ft0 as the ninth, that hold
+     * their value in xbox_fpd[] for the time being, see tcg/fpu_helper.c.
+     * cpu_xbox_fpd_sync() puts them all back where they are expected.
+     */
+#define XBOX_X87_DOUBLES
+    uint16_t xbox_fpd_mask;
+    uint16_t xbox_fps_mask; /* a subset: single precision holds the value */
+    double xbox_fpd[9];
+#endif
 
     float_status mmx_status; /* for 3DNow! float ops */
     float_status sse_status;
@@ -2801,6 +2812,9 @@ int get_pg_mode(CPUX86State *env);
 
 /* Set all non-runtime-variable float_status fields to x86 handling */
 void cpu_init_fp_statuses(CPUX86State *env);
+#ifdef XBOX_X87_DOUBLES
+void cpu_xbox_fpd_sync(CPUX86State *env);
+#endif
 void update_fp_status(CPUX86State *env);
 void update_mxcsr_status(CPUX86State *env);
 void update_mxcsr_from_sse_status(CPUX86State *env);

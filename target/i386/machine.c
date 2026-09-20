@@ -221,6 +221,9 @@ static int cpu_pre_save(void *opaque)
     X86CPU *cpu = opaque;
     CPUX86State *env = &cpu->env;
     int i;
+#ifdef XBOX_X87_DOUBLES
+    cpu_xbox_fpd_sync(env);
+#endif
     env->v_tpr = env->int_ctl & V_TPR_MASK;
     /* FPU */
     env->fpus_vmstate = (env->fpus & ~0x3800) | (env->fpstt & 0x7) << 11;
@@ -316,6 +319,11 @@ static int cpu_post_load(void *opaque, int version_id)
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
     int i;
+
+#ifdef XBOX_X87_DOUBLES
+    env->xbox_fpd_mask = 0;
+    env->xbox_fps_mask = 0;
+#endif
 
     if (env->tsc_khz && env->user_tsc_khz &&
         env->tsc_khz != env->user_tsc_khz) {

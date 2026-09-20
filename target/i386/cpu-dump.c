@@ -496,6 +496,9 @@ void x86_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                      env->fpstt,
                      fptag,
                      env->mxcsr);
+#ifdef XBOX_X87_DOUBLES
+        cpu_xbox_fpd_sync(env);
+#endif
         for(i=0;i<8;i++) {
             CPU_LDoubleU u;
             u.d = env->fpregs[i].d;

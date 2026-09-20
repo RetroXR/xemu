@@ -30,10 +30,72 @@
 #include "access.h"
 
 /* float macros */
+#ifdef XBOX_X87_DOUBLES
+/*
+ * Without an 80 bit format in hardware, the hard FPU helpers compute in double
+ * precision where that gives the result of softfloat. Going from floatx80 to
+ * double and back for every operation costs more than the operation, and what
+ * a game does with a value is mostly load it, compute with it and store it.
+ * So a value that a helper produces as a double, always a zero or a normal
+ * number, stays one, in env->xbox_fpd[] with its bit set in xbox_fpd_mask, and
+ * the register or FT0 itself is stale. Everything that is not written for
+ * that gets at the registers through the macros below, which bring the
+ * floatx80 up to date first.
+ */
+#define XBOX_FPD_FT0 8
+
+static inline floatx80 xbox_fpd_to_floatx80(double d)
+{
+    union {
+        double d;
+        uint64_t i;
+    } u = { .d = d };
+    uint16_t sign = (u.i >> 63) << 15;
+    int exp = (u.i >> 52) & 0x7ff;
+
+    if ((u.i << 1) == 0) {
+        return (floatx80){ .low = 0, .high = sign };
+    }
+    return (floatx80){
+        .low = (1ULL << 63) | ((u.i << 12) >> 1),
+        .high = sign | (exp + 16383 - 1023),
+    };
+}
+
+static inline floatx80 *xbox_fpd_raw(CPUX86State *env, int idx)
+{
+    return idx == XBOX_FPD_FT0 ? &env->ft0 : &env->fpregs[idx].d;
+}
+
+static inline floatx80 *xbox_fpd_ref(CPUX86State *env, int idx)
+{
+    if (unlikely(env->xbox_fpd_mask & (1 << idx))) {
+        env->xbox_fpd_mask &= ~(1 << idx);
+        env->xbox_fps_mask &= ~(1 << idx);
+        *xbox_fpd_raw(env, idx) = xbox_fpd_to_floatx80(env->xbox_fpd[idx]);
+    }
+    return xbox_fpd_raw(env, idx);
+}
+
+static inline void xbox_fpd_forget(CPUX86State *env, int idx)
+{
+    env->xbox_fpd_mask &= ~(1 << idx);
+    env->xbox_fps_mask &= ~(1 << idx);
+}
+
+#define FT0    (*xbox_fpd_ref(env, XBOX_FPD_FT0))
+#define ST0    (*xbox_fpd_ref(env, env->fpstt))
+#define ST(n)  (*xbox_fpd_ref(env, (env->fpstt + (n)) & 7))
+#define ST1    ST(1)
+/* For what writes to fpregs[] directly */
+#define XBOX_FPD_FORGET(idx) xbox_fpd_forget(env, idx)
+#else
 #define FT0    (env->ft0)
 #define ST0    (env->fpregs[env->fpstt].d)
 #define ST(n)  (env->fpregs[(env->fpstt + (n)) & 7].d)
 #define ST1    ST(1)
+#define XBOX_FPD_FORGET(idx)
+#endif
 
 #define FPU_RC_SHIFT        10
 #define FPU_RC_MASK         (3 << FPU_RC_SHIFT)
@@ -523,6 +585,161 @@ floatx80 int32_to_floatx80__hard(int32_t a, float_status *status)
 
 #endif /* defined(XBOX) && (defined(__x86_64__) || defined(__aarch64__)) */
 
+#if defined(XBOX_X87_DOUBLES) && defined(USE_HARD_FPU)
+#define XBOX_FPD_FAST
+
+static inline bool fpd_is_ordinary(double d)
+{
+    uint64_t bits = hard_f64_to_bits(d);
+    int exp = (bits >> 52) & 0x7ff;
+
+    return (bits << 1) == 0 || (exp != 0 && exp != 0x7ff);
+}
+
+/* The value of a register as a double, if it has one */
+static inline bool fpd_get(CPUX86State *env, int idx, double *d)
+{
+    if (env->xbox_fpd_mask & (1 << idx)) {
+        *d = env->xbox_fpd[idx];
+        return true;
+    }
+    return hard_floatx80_to_f64(*xbox_fpd_raw(env, idx), d);
+}
+
+static inline void fpd_set(CPUX86State *env, int idx, double d)
+{
+    env->xbox_fpd[idx] = d;
+    env->xbox_fpd_mask |= 1 << idx;
+    env->xbox_fps_mask &= ~(1 << idx);
+}
+
+/* For a value that single precision holds as a normal number or zero */
+static inline void fpd_set_single(CPUX86State *env, int idx, double d)
+{
+    env->xbox_fpd[idx] = d;
+    env->xbox_fpd_mask |= 1 << idx;
+    env->xbox_fps_mask |= 1 << idx;
+}
+
+static inline bool fpd_f32_is_ordinary(float f)
+{
+    union {
+        float f;
+        uint32_t i;
+    } u = { .f = f };
+    int exp = (u.i >> 23) & 0xff;
+
+    return (u.i << 1) == 0 || (exp != 0 && exp != 0xff);
+}
+
+static inline void fpd_set_f32(CPUX86State *env, int idx, float f)
+{
+    if (fpd_f32_is_ordinary(f)) {
+        fpd_set_single(env, idx, f);
+    } else {
+        fpd_set(env, idx, f);
+    }
+}
+
+/* @d is within the range of a float: is it one? */
+static inline void fpd_set_f32_exact(CPUX86State *env, int idx, double d)
+{
+    float f = (float)d;
+
+    if ((double)f == d && fpd_f32_is_ordinary(f)) {
+        fpd_set_single(env, idx, d);
+    } else {
+        fpd_set(env, idx, d);
+    }
+}
+
+static inline void fpd_move(CPUX86State *env, int dst, int src)
+{
+    if (env->xbox_fpd_mask & (1 << src)) {
+        if (env->xbox_fps_mask & (1 << src)) {
+            fpd_set_single(env, dst, env->xbox_fpd[src]);
+        } else {
+            fpd_set(env, dst, env->xbox_fpd[src]);
+        }
+    } else {
+        env->xbox_fpd_mask &= ~(1 << dst);
+        env->xbox_fps_mask &= ~(1 << dst);
+        *xbox_fpd_raw(env, dst) = *xbox_fpd_raw(env, src);
+    }
+}
+
+static inline int fpd_push(CPUX86State *env)
+{
+    int new_fpstt = (env->fpstt - 1) & 7;
+
+    env->fpstt = new_fpstt;
+    env->fptags[new_fpstt] = 0; /* validate stack entry */
+    return new_fpstt;
+}
+
+/* The conditions and the rounding are those of HARD_FPU_ARITH() */
+#define FPD_ARITH(name, op, zero_is_exact)                                   \
+static inline __attribute__((always_inline))                                 \
+bool fpd_##name(CPUX86State *env, int dst, int a, int b)                     \
+{                                                                            \
+    double x, y;                                                             \
+    bool single = env->fp_status.floatx80_rounding_precision ==              \
+                  floatx80_precision_s;                                      \
+                                                                             \
+    /*                                                                       \
+     * What games run with: single precision selected, and operands that    \
+     * are single precision. The host's single precision arithmetic rounds   \
+     * once, to the same 24 bits, and differs only when the result leaves    \
+     * its smaller exponent range.                                           \
+     */                                                                      \
+    if (single && !(~env->xbox_fps_mask & ((1 << a) | (1 << b))) &&          \
+        env->fp_status.float_rounding_mode == float_round_nearest_even) {    \
+        float fx = (float)env->xbox_fpd[a], fy = (float)env->xbox_fpd[b];    \
+        float fr = fx op fy;                                                 \
+        x = fx;                                                              \
+        y = fy;                                                              \
+        if (fpd_f32_is_ordinary(fr) && (fr != 0.0f || (zero_is_exact))) {    \
+            fpd_set_single(env, dst, fr);                                    \
+            return true;                                                     \
+        }                                                                    \
+    }                                                                        \
+    if (hard_fpu_usable(&env->fp_status) && fpd_get(env, a, &x) &&           \
+        fpd_get(env, b, &y)) {                                               \
+        double r = x op y;                                                   \
+        if (single) {                                                        \
+            r = hard_f64_round_to_single(r);                                 \
+        }                                                                    \
+        if ((r != 0.0 || (zero_is_exact)) && fpd_is_ordinary(r)) {           \
+            if (single && __builtin_fabs(r) <= 0x1.fffffep+127) {            \
+                fpd_set_f32_exact(env, dst, r);                              \
+            } else {                                                         \
+                fpd_set(env, dst, r);                                        \
+            }                                                                \
+            return true;                                                     \
+        }                                                                    \
+    }                                                                        \
+    return false;                                                            \
+}
+
+FPD_ARITH(add, +, true)
+FPD_ARITH(sub, -, true)
+FPD_ARITH(mul, *, x == 0.0 || y == 0.0)
+FPD_ARITH(div, /, x == 0.0 && y != 0.0)
+
+static inline bool fpd_compare(CPUX86State *env, int a, int b,
+                               FloatRelation *ret)
+{
+    double x, y;
+
+    if (!fpd_get(env, a, &x) || !fpd_get(env, b, &y)) {
+        return false;
+    }
+    *ret = x < y ? float_relation_less :
+           x > y ? float_relation_greater : float_relation_equal;
+    return true;
+}
+#endif /* XBOX_X87_DOUBLES && USE_HARD_FPU */
+
 static inline void fpush(CPUX86State *env)
 {
     env->fpstt = (env->fpstt - 1) & 7;
@@ -576,6 +793,15 @@ static inline floatx80 double_to_floatx80(CPUX86State *env, double a)
     u.d = a;
     return float64_to_floatx80(u.f64, &env->fp_status);
 }
+
+#if defined(XBOX_X87_DOUBLES) && !defined(USE_HARD_FPU)
+void cpu_xbox_fpd_sync(CPUX86State *env)
+{
+    for (int i = 0; i <= XBOX_FPD_FT0; i++) {
+        xbox_fpd_ref(env, i);
+    }
+}
+#endif
 
 #ifndef USE_HARD_FPU
 static void fpu_set_exception(CPUX86State *env, int mask)
@@ -694,6 +920,16 @@ static void fpu_raise_exception(CPUX86State *env, uintptr_t retaddr)
 
 void helper_flds_FT0(CPUX86State *env, uint32_t val)
 {
+#ifdef XBOX_FPD_FAST
+    if (((val >> 23) & 0xff) != 0xff) {
+        union {
+            uint32_t i;
+            float f;
+        } v = { .i = val };
+        fpd_set_f32(env, XBOX_FPD_FT0, v.f);
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     union {
         float32 f;
@@ -707,6 +943,12 @@ void helper_flds_FT0(CPUX86State *env, uint32_t val)
 
 void helper_fldl_FT0(CPUX86State *env, uint64_t val)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_is_ordinary(hard_f64_from_bits(val))) {
+        fpd_set(env, XBOX_FPD_FT0, hard_f64_from_bits(val));
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     union {
         float64 f;
@@ -720,11 +962,25 @@ void helper_fldl_FT0(CPUX86State *env, uint64_t val)
 
 void helper_fildl_FT0(CPUX86State *env, int32_t val)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_set(env, XBOX_FPD_FT0, val);
+    return;
+#endif
     FT0 = int32_to_floatx80(val, &env->fp_status);
 }
 
 void helper_flds_ST0(CPUX86State *env, uint32_t val)
 {
+#ifdef XBOX_FPD_FAST
+    if (((val >> 23) & 0xff) != 0xff) {
+        union {
+            uint32_t i;
+            float f;
+        } v = { .i = val };
+        fpd_set_f32(env, fpd_push(env), v.f);
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int new_fpstt;
     union {
@@ -734,6 +990,7 @@ void helper_flds_ST0(CPUX86State *env, uint32_t val)
 
     new_fpstt = (env->fpstt - 1) & 7;
     u.i = val;
+    XBOX_FPD_FORGET(new_fpstt);
     env->fpregs[new_fpstt].d = float32_to_floatx80(u.f, &env->fp_status);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
@@ -742,6 +999,12 @@ void helper_flds_ST0(CPUX86State *env, uint32_t val)
 
 void helper_fldl_ST0(CPUX86State *env, uint64_t val)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_is_ordinary(hard_f64_from_bits(val))) {
+        fpd_set(env, fpd_push(env), hard_f64_from_bits(val));
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int new_fpstt;
     union {
@@ -751,6 +1014,7 @@ void helper_fldl_ST0(CPUX86State *env, uint64_t val)
 
     new_fpstt = (env->fpstt - 1) & 7;
     u.i = val;
+    XBOX_FPD_FORGET(new_fpstt);
     env->fpregs[new_fpstt].d = float64_to_floatx80(u.f, &env->fp_status);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
@@ -766,10 +1030,15 @@ static FloatX80RoundPrec tmp_maximise_precision(float_status *st)
 
 void helper_fildl_ST0(CPUX86State *env, int32_t val)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_set(env, fpd_push(env), val);
+    return;
+#endif
     int new_fpstt;
     FloatX80RoundPrec old = tmp_maximise_precision(&env->fp_status);
 
     new_fpstt = (env->fpstt - 1) & 7;
+    XBOX_FPD_FORGET(new_fpstt);
     env->fpregs[new_fpstt].d = int32_to_floatx80(val, &env->fp_status);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
@@ -783,6 +1052,7 @@ void helper_fildll_ST0(CPUX86State *env, int64_t val)
     FloatX80RoundPrec old = tmp_maximise_precision(&env->fp_status);
 
     new_fpstt = (env->fpstt - 1) & 7;
+    XBOX_FPD_FORGET(new_fpstt);
     env->fpregs[new_fpstt].d = int64_to_floatx80(val, &env->fp_status);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
@@ -792,6 +1062,17 @@ void helper_fildll_ST0(CPUX86State *env, int64_t val)
 
 uint32_t helper_fsts_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if ((env->xbox_fpd_mask & (1 << env->fpstt)) &&
+        env->fp_status.float_rounding_mode == float_round_nearest_even &&
+        __builtin_fabs(env->xbox_fpd[env->fpstt]) <= 0x1.fffffep+127) {
+        union {
+            float f;
+            uint32_t i;
+        } v = { .f = (float)env->xbox_fpd[env->fpstt] };
+        return v.i;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     union {
         float32 f;
@@ -805,6 +1086,12 @@ uint32_t helper_fsts_ST0(CPUX86State *env)
 
 uint64_t helper_fstl_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (env->xbox_fpd_mask & (1 << env->fpstt)) {
+        /* Exact whatever the rounding */
+        return hard_f64_to_bits(env->xbox_fpd[env->fpstt]);
+    }
+#endif
     int old_flags = save_exception_flags(env);
     union {
         float64 f;
@@ -832,6 +1119,15 @@ int32_t helper_fist_ST0(CPUX86State *env)
 
 int32_t helper_fistl_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if ((env->xbox_fpd_mask & (1 << env->fpstt)) &&
+        env->fp_status.float_rounding_mode == float_round_nearest_even) {
+        double r = __builtin_rint(env->xbox_fpd[env->fpstt]);
+        if (r >= -2147483648.0 && r <= 2147483647.0) {
+            return (int32_t)r;
+        }
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int32_t val;
 
@@ -872,6 +1168,14 @@ int32_t helper_fistt_ST0(CPUX86State *env)
 
 int32_t helper_fisttl_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (env->xbox_fpd_mask & (1 << env->fpstt)) {
+        double r = __builtin_trunc(env->xbox_fpd[env->fpstt]);
+        if (r >= -2147483648.0 && r <= 2147483647.0) {
+            return (int32_t)r;
+        }
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int32_t val;
 
@@ -904,6 +1208,7 @@ void helper_fldt_ST0(CPUX86State *env, target_ulong ptr)
     access_prepare(&ac, env, ptr, 10, MMU_DATA_LOAD, GETPC());
 
     new_fpstt = (env->fpstt - 1) & 7;
+    XBOX_FPD_FORGET(new_fpstt);
     env->fpregs[new_fpstt].d = do_fldt(&ac, ptr);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
@@ -948,26 +1253,55 @@ void helper_ffree_STN(CPUX86State *env, int st_index)
 
 void helper_fmov_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_move(env, env->fpstt, XBOX_FPD_FT0);
+    return;
+#endif
     ST0 = FT0;
 }
 
 void helper_fmov_FT0_STN(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_move(env, XBOX_FPD_FT0, (env->fpstt + st_index) & 7);
+    return;
+#endif
     FT0 = ST(st_index);
 }
 
 void helper_fmov_ST0_STN(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_move(env, env->fpstt, (env->fpstt + st_index) & 7);
+    return;
+#endif
     ST0 = ST(st_index);
 }
 
 void helper_fmov_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_move(env, (env->fpstt + st_index) & 7, env->fpstt);
+    return;
+#endif
     ST(st_index) = ST0;
 }
 
 void helper_fxchg_ST0_STN(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int a = env->fpstt, b = (env->fpstt + st_index) & 7;
+    if ((env->xbox_fpd_mask & (1 << a)) && (env->xbox_fpd_mask & (1 << b))) {
+        double d = env->xbox_fpd[a];
+        env->xbox_fpd[a] = env->xbox_fpd[b];
+        env->xbox_fpd[b] = d;
+        if (!(env->xbox_fps_mask & (1 << a)) !=
+            !(env->xbox_fps_mask & (1 << b))) {
+            env->xbox_fps_mask ^= (1 << a) | (1 << b);
+        }
+        return;
+    }
+#endif
     floatx80 tmp;
 
     tmp = ST(st_index);
@@ -981,6 +1315,13 @@ static const int fcom_ccval[4] = {0x0100, 0x4000, 0x0000, 0x4500};
 
 void helper_fcom_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    FloatRelation rel;
+    if (fpd_compare(env, env->fpstt, XBOX_FPD_FT0, &rel)) {
+        env->fpus = (env->fpus & ~0x4500) | fcom_ccval[rel + 1];
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
@@ -991,6 +1332,13 @@ void helper_fcom_ST0_FT0(CPUX86State *env)
 
 void helper_fucom_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    FloatRelation rel;
+    if (fpd_compare(env, env->fpstt, XBOX_FPD_FT0, &rel)) {
+        env->fpus = (env->fpus & ~0x4500) | fcom_ccval[rel + 1];
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
@@ -1003,6 +1351,15 @@ static const int fcomi_ccval[4] = {CC_C, CC_Z, 0, CC_Z | CC_P | CC_C};
 
 void helper_fcomi_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    FloatRelation rel;
+    if (fpd_compare(env, env->fpstt, XBOX_FPD_FT0, &rel)) {
+        int fl = cpu_cc_compute_all(env) & ~(CC_Z | CC_P | CC_C);
+        CC_SRC = fl | fcomi_ccval[rel + 1];
+        CC_OP = CC_OP_EFLAGS;
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int eflags;
     FloatRelation ret;
@@ -1016,6 +1373,15 @@ void helper_fcomi_ST0_FT0(CPUX86State *env)
 
 void helper_fucomi_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    FloatRelation rel;
+    if (fpd_compare(env, env->fpstt, XBOX_FPD_FT0, &rel)) {
+        int fl = cpu_cc_compute_all(env) & ~(CC_Z | CC_P | CC_C);
+        CC_SRC = fl | fcomi_ccval[rel + 1];
+        CC_OP = CC_OP_EFLAGS;
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     int eflags;
     FloatRelation ret;
@@ -1029,6 +1395,11 @@ void helper_fucomi_ST0_FT0(CPUX86State *env)
 
 void helper_fadd_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_add(env, env->fpstt, env->fpstt, XBOX_FPD_FT0)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST0 = floatx80_add(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1036,6 +1407,11 @@ void helper_fadd_ST0_FT0(CPUX86State *env)
 
 void helper_fmul_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_mul(env, env->fpstt, env->fpstt, XBOX_FPD_FT0)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST0 = floatx80_mul(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1043,6 +1419,11 @@ void helper_fmul_ST0_FT0(CPUX86State *env)
 
 void helper_fsub_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_sub(env, env->fpstt, env->fpstt, XBOX_FPD_FT0)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST0 = floatx80_sub(ST0, FT0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1050,6 +1431,11 @@ void helper_fsub_ST0_FT0(CPUX86State *env)
 
 void helper_fsubr_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_sub(env, env->fpstt, XBOX_FPD_FT0, env->fpstt)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST0 = floatx80_sub(FT0, ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1057,11 +1443,21 @@ void helper_fsubr_ST0_FT0(CPUX86State *env)
 
 void helper_fdiv_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_div(env, env->fpstt, env->fpstt, XBOX_FPD_FT0)) {
+        return;
+    }
+#endif
     ST0 = helper_fdiv(env, ST0, FT0);
 }
 
 void helper_fdivr_ST0_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (fpd_div(env, env->fpstt, XBOX_FPD_FT0, env->fpstt)) {
+        return;
+    }
+#endif
     ST0 = helper_fdiv(env, FT0, ST0);
 }
 
@@ -1069,6 +1465,12 @@ void helper_fdivr_ST0_FT0(CPUX86State *env)
 
 void helper_fadd_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_add(env, stn, stn, env->fpstt)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST(st_index) = floatx80_add(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1076,6 +1478,12 @@ void helper_fadd_STN_ST0(CPUX86State *env, int st_index)
 
 void helper_fmul_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_mul(env, stn, stn, env->fpstt)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST(st_index) = floatx80_mul(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1083,6 +1491,12 @@ void helper_fmul_STN_ST0(CPUX86State *env, int st_index)
 
 void helper_fsub_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_sub(env, stn, stn, env->fpstt)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST(st_index) = floatx80_sub(ST(st_index), ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1090,6 +1504,12 @@ void helper_fsub_STN_ST0(CPUX86State *env, int st_index)
 
 void helper_fsubr_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_sub(env, stn, env->fpstt, stn)) {
+        return;
+    }
+#endif
     int old_flags = save_exception_flags(env);
     ST(st_index) = floatx80_sub(ST0, ST(st_index), &env->fp_status);
     merge_exception_flags(env, old_flags);
@@ -1097,6 +1517,12 @@ void helper_fsubr_STN_ST0(CPUX86State *env, int st_index)
 
 void helper_fdiv_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_div(env, stn, stn, env->fpstt)) {
+        return;
+    }
+#endif
     floatx80 *p;
 
     p = &ST(st_index);
@@ -1105,6 +1531,12 @@ void helper_fdiv_STN_ST0(CPUX86State *env, int st_index)
 
 void helper_fdivr_STN_ST0(CPUX86State *env, int st_index)
 {
+#ifdef XBOX_FPD_FAST
+    int stn = (env->fpstt + st_index) & 7;
+    if (fpd_div(env, stn, env->fpstt, stn)) {
+        return;
+    }
+#endif
     floatx80 *p;
 
     p = &ST(st_index);
@@ -1114,16 +1546,33 @@ void helper_fdivr_STN_ST0(CPUX86State *env, int st_index)
 /* misc FPU operations */
 void helper_fchs_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (env->xbox_fpd_mask & (1 << env->fpstt)) {
+        env->xbox_fpd[env->fpstt] = -env->xbox_fpd[env->fpstt];
+        return;
+    }
+#endif
     ST0 = floatx80_chs(ST0);
 }
 
 void helper_fabs_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    if (env->xbox_fpd_mask & (1 << env->fpstt)) {
+        env->xbox_fpd[env->fpstt] =
+            __builtin_fabs(env->xbox_fpd[env->fpstt]);
+        return;
+    }
+#endif
     ST0 = floatx80_abs(ST0);
 }
 
 void helper_fld1_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_set_single(env, env->fpstt, 1.0);
+    return;
+#endif
     ST0 = floatx80_one;
 }
 
@@ -1193,11 +1642,19 @@ void helper_fldln2_ST0(CPUX86State *env)
 
 void helper_fldz_ST0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_set_single(env, env->fpstt, 0.0);
+    return;
+#endif
     ST0 = floatx80_zero;
 }
 
 void helper_fldz_FT0(CPUX86State *env)
 {
+#ifdef XBOX_FPD_FAST
+    fpd_set_single(env, XBOX_FPD_FT0, 0.0);
+    return;
+#endif
     FT0 = floatx80_zero;
 }
 
@@ -2911,7 +3368,11 @@ static void do_fstenv(X86Access *ac, target_ulong ptr, int data32)
         if (env->fptags[i]) {
             fptag |= 3;
         } else {
+#ifdef XBOX_X87_DOUBLES
+            tmp.d = *xbox_fpd_ref(env, i);
+#else
             tmp.d = env->fpregs[i].d;
+#endif
             exp = EXPD(tmp);
             mant = MANTD(tmp);
             if (exp == 0 && mant == 0) {
@@ -3751,6 +4212,12 @@ void helper_ldmxcsr(CPUX86State *env, uint32_t val)
 
 void helper_enter_mmx(CPUX86State *env)
 {
+#ifdef XBOX_X87_DOUBLES
+    /* The MMX registers are the significands, and are written in place */
+    for (int i = 0; i < 8; i++) {
+        xbox_fpd_ref(env, i);
+    }
+#endif
     env->fpstt = 0;
     *(uint32_t *)(env->fptags) = 0;
     *(uint32_t *)(env->fptags + 4) = 0;
