@@ -233,6 +233,12 @@ typedef struct TextureBinding {
     uint32_t submit_time;
 } TextureBinding;
 
+/* What a texture in the cache covers, see texture_ranges */
+typedef struct TextureRange {
+    hwaddr addr, end; /* end < addr while the entry has no texture */
+    hwaddr palette_addr, palette_end;
+} TextureRange;
+
 typedef struct QueryReport {
     QSIMPLEQ_ENTRY(QueryReport) entry;
     bool clear;
@@ -433,6 +439,12 @@ typedef struct PGRAPHVkState {
 
     Lru texture_cache;
     TextureBinding *texture_cache_entries;
+    /*
+     * The memory of texture_cache_entries[i], for finding the textures that
+     * a write may have changed without walking the cache itself
+     */
+    TextureRange *texture_ranges;
+    size_t num_texture_ranges;
     TextureBinding *texture_bindings[NV2A_MAX_TEXTURES];
     TextureBinding dummy_texture;
     bool texture_bindings_changed;

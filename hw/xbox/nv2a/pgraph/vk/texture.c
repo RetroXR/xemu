@@ -449,30 +449,25 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx,
     return layout;
 }
 
-struct pgraph_texture_possibly_dirty_struct {
-    hwaddr addr, end;
+static const TextureRange texture_range_none = {
+    .addr = 1, .end = 0, .palette_addr = 1, .palette_end = 0,
 };
 
-static void mark_textures_possibly_dirty_visitor(Lru *lru, LruNode *node, void *opaque)
+static void set_texture_range(PGRAPHVkState *r, TextureBinding *snode,
+                              bool valid)
 {
-    struct pgraph_texture_possibly_dirty_struct *test = opaque;
+    TextureRange *range = &r->texture_ranges[snode - r->texture_cache_entries];
 
-    TextureBinding *tnode = container_of(node, TextureBinding, node);
-    if (tnode->possibly_dirty) {
-        return;
+    *range = texture_range_none;
+    if (valid) {
+        range->addr = snode->key.texture_vram_offset;
+        range->end = range->addr + snode->key.texture_length - 1;
+        if (snode->key.palette_length > 0) {
+            range->palette_addr = snode->key.palette_vram_offset;
+            range->palette_end =
+                range->palette_addr + snode->key.palette_length - 1;
+        }
     }
-
-    uintptr_t k_tex_addr = tnode->key.texture_vram_offset;
-    uintptr_t k_tex_end = k_tex_addr + tnode->key.texture_length - 1;
-    bool overlapping = !(test->addr > k_tex_end || k_tex_addr > test->end);
-
-    if (tnode->key.palette_length > 0) {
-        uintptr_t k_pal_addr = tnode->key.palette_vram_offset;
-        uintptr_t k_pal_end = k_pal_addr + tnode->key.palette_length - 1;
-        overlapping |= !(test->addr > k_pal_end || k_pal_addr > test->end);
-    }
-
-    tnode->possibly_dirty |= overlapping;
 }
 
 void pgraph_vk_mark_textures_possibly_dirty(NV2AState *d,
@@ -482,14 +477,21 @@ void pgraph_vk_mark_textures_possibly_dirty(NV2AState *d,
     addr &= TARGET_PAGE_MASK;
     assert(end <= memory_region_size(d->vram));
 
-    struct pgraph_texture_possibly_dirty_struct test = {
-        .addr = addr,
-        .end = end,
-    };
+    /*
+     * This runs whenever a texture that is bound has had its pages written
+     * to, which for some is every time. The entries of the cache are a linked
+     * list of a thousand structures all over memory; their ranges side by side
+     * are a few cache lines.
+     */
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    for (size_t i = 0; i < r->num_texture_ranges; i++) {
+        const TextureRange *range = &r->texture_ranges[i];
 
-    lru_visit_active(&d->pgraph.vk_renderer_state->texture_cache,
-                     mark_textures_possibly_dirty_visitor,
-                     &test);
+        if ((addr <= range->end && range->addr <= end) ||
+            (addr <= range->palette_end && range->palette_addr <= end)) {
+            r->texture_cache_entries[i].possibly_dirty = true;
+        }
+    }
 }
 
 static bool check_texture_dirty(NV2AState *d, hwaddr addr, hwaddr size)
@@ -1375,6 +1377,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     NV2A_VK_DPRINTF("Cache miss");
 
     memcpy(&snode->key, &key, sizeof(key));
+    set_texture_range(r, snode, true);
     snode->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     snode->possibly_dirty = false;
     snode->hash = content_hash;
@@ -1682,6 +1685,8 @@ static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBindin
     vmaDestroyImage(r->allocator, snode->image, snode->allocation);
     snode->image = VK_NULL_HANDLE;
     snode->allocation = VK_NULL_HANDLE;
+
+    set_texture_range(r, snode, false);
 }
 
 static bool texture_cache_entry_pre_evict(Lru *lru, LruNode *node)
@@ -1727,6 +1732,11 @@ static void texture_cache_init(PGRAPHVkState *r)
     lru_init(&r->texture_cache);
     r->texture_cache_entries = g_malloc_n(texture_cache_size, sizeof(TextureBinding));
     assert(r->texture_cache_entries != NULL);
+    r->num_texture_ranges = texture_cache_size;
+    r->texture_ranges = g_new(TextureRange, texture_cache_size);
+    for (int i = 0; i < texture_cache_size; i++) {
+        r->texture_ranges[i] = texture_range_none;
+    }
     for (int i = 0; i < texture_cache_size; i++) {
         lru_add_free(&r->texture_cache, &r->texture_cache_entries[i].node);
     }
@@ -1741,6 +1751,8 @@ static void texture_cache_finalize(PGRAPHVkState *r)
     lru_flush(&r->texture_cache);
     g_free(r->texture_cache_entries);
     r->texture_cache_entries = NULL;
+    g_free(r->texture_ranges);
+    r->texture_ranges = NULL;
 }
 
 void pgraph_vk_trim_texture_cache(PGRAPHState *pg)
