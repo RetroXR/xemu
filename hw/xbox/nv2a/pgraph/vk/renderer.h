@@ -110,6 +110,7 @@ typedef struct StorageBuffer {
     VmaAllocation allocation;
     VkMemoryPropertyFlags properties;
     size_t buffer_offset;
+    size_t sync_offset; /* Staging buffers: copied to the device up to here */
     size_t buffer_size;
     uint8_t *mapped;
 } StorageBuffer;
@@ -354,7 +355,13 @@ typedef struct PGRAPHVkState {
 
     VkQueue queue;
     VkCommandPool command_pool;
-    VkCommandBuffer command_buffers[2];
+    /* Two pairs of a draw and an auxiliary buffer, see submit_partial() */
+    VkCommandBuffer command_buffers[4];
+    int command_buffer_slot;
+    VkSemaphore partial_semaphore;
+    VkFence partial_fence;
+    bool partial_pending;
+    unsigned int draws_since_submit;
 
     VkCommandBuffer command_buffer;
     VkSemaphore command_buffer_semaphore;

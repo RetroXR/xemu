@@ -339,12 +339,15 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     };
     VK_CHECK(vkCreateSemaphore(r->device, &semaphore_info, NULL,
                                &r->command_buffer_semaphore));
+    VK_CHECK(vkCreateSemaphore(r->device, &semaphore_info, NULL,
+                               &r->partial_semaphore));
 
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
     VK_CHECK(
         vkCreateFence(r->device, &fence_info, NULL, &r->command_buffer_fence));
+    VK_CHECK(vkCreateFence(r->device, &fence_info, NULL, &r->partial_fence));
 }
 
 void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
@@ -356,7 +359,9 @@ void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
     finalize_render_passes(r);
 
     vkDestroyFence(r->device, r->command_buffer_fence, NULL);
+    vkDestroyFence(r->device, r->partial_fence, NULL);
     vkDestroySemaphore(r->device, r->command_buffer_semaphore, NULL);
+    vkDestroySemaphore(r->device, r->partial_semaphore, NULL);
 }
 
 static void init_render_pass_state(PGRAPHState *pg, RenderPassState *state)
@@ -1223,18 +1228,29 @@ static void end_query(PGRAPHVkState *r)
     r->query_in_flight = false;
 }
 
+/*
+ * Copies what was appended since the last time. The buffer starts over when
+ * @reset is set, which takes the GPU being done with all of it.
+ */
 static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
-                                int index_src, int index_dst)
+                                int index_src, int index_dst, bool reset)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     StorageBuffer *b_src = &r->storage_buffers[index_src];
     StorageBuffer *b_dst = &r->storage_buffers[index_dst];
 
-    if (!b_src->buffer_offset) {
+    if (b_src->buffer_offset == b_src->sync_offset) {
+        if (reset) {
+            b_src->buffer_offset = b_src->sync_offset = 0;
+        }
         return;
     }
 
-    VkBufferCopy copy_region = { .size = b_src->buffer_offset };
+    VkBufferCopy copy_region = {
+        .srcOffset = b_src->sync_offset,
+        .dstOffset = b_src->sync_offset,
+        .size = b_src->buffer_offset - b_src->sync_offset,
+    };
     vkCmdCopyBuffer(cmd, b_src->buffer, b_dst->buffer, 1, &copy_region);
 
     VkAccessFlags dst_access_mask;
@@ -1265,12 +1281,16 @@ static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = b_dst->buffer,
-        .size = b_src->buffer_offset
+        .offset = copy_region.dstOffset,
+        .size = copy_region.size,
     };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage_mask, 0,
                          0, NULL, 1, &barrier, 0, NULL);
 
-    b_src->buffer_offset = 0;
+    b_src->sync_offset = b_src->buffer_offset;
+    if (reset) {
+        b_src->buffer_offset = b_src->sync_offset = 0;
+    }
 }
 
 static void flush_memory_buffer(PGRAPHState *pg, VkCommandBuffer cmd)
@@ -1399,11 +1419,15 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         VK_CHECK(vkEndCommandBuffer(r->command_buffer));
 
         VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg); // FIXME: Cleanup
-        sync_staging_buffer(pg, cmd, BUFFER_INDEX_STAGING, BUFFER_INDEX);
+        sync_staging_buffer(pg, cmd, BUFFER_INDEX_STAGING, BUFFER_INDEX, true);
         sync_staging_buffer(pg, cmd, BUFFER_VERTEX_INLINE_STAGING,
-                                BUFFER_VERTEX_INLINE);
-        sync_staging_buffer(pg, cmd, BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM);
+                            BUFFER_VERTEX_INLINE, true);
+        sync_staging_buffer(pg, cmd, BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM,
+                            true);
         bitmap_clear(r->uploaded_bitmap, 0, r->bitmap_size);
+        r->draws_since_submit = 0;
+        /* The queue works in order, so an earlier part is done by then too */
+        r->partial_pending = false;
         flush_memory_buffer(pg, cmd);
         VK_CHECK(vkEndCommandBuffer(r->aux_command_buffer));
         r->in_aux_command_buffer = false;
@@ -1597,6 +1621,85 @@ static float clamp_line_width_to_device_limits(PGRAPHState *pg, float width)
     return fminf(fmaxf(min_width, width), max_width);
 }
 
+/*
+ * A frame is recorded into one command buffer and submitted at its end, which
+ * has the GPU start on it when the PFIFO thread is done with it: their times
+ * add up. Between two render passes, once a good number of draws has come
+ * together, what there is gets submitted without waiting for it, and recording
+ * goes on in the other pair of command buffers while the GPU works.
+ *
+ * Everything that tells whether the command buffer uses something goes on
+ * covering all the parts: the start time, the pages copied to the vertex RAM
+ * buffer, descriptor sets, framebuffers and queries are only let go of by
+ * pgraph_vk_finish(). The staging buffers are appended to as before, and each
+ * part copies what is new. One part can be in flight; the next one waits for
+ * it, which it will rarely have to.
+ */
+#define PARTIAL_SUBMIT_DRAWS 192
+
+static void submit_partial(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    assert(r->in_command_buffer);
+    assert(!r->in_render_pass);
+    assert(!r->query_in_flight);
+
+    if (r->partial_pending) {
+        VK_CHECK(vkWaitForFences(r->device, 1, &r->partial_fence, VK_TRUE,
+                                 UINT64_MAX));
+        r->partial_pending = false;
+    }
+
+    VK_CHECK(vkEndCommandBuffer(r->command_buffer));
+
+    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+    sync_staging_buffer(pg, cmd, BUFFER_INDEX_STAGING, BUFFER_INDEX, false);
+    sync_staging_buffer(pg, cmd, BUFFER_VERTEX_INLINE_STAGING,
+                        BUFFER_VERTEX_INLINE, false);
+    sync_staging_buffer(pg, cmd, BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM, false);
+    flush_memory_buffer(pg, cmd);
+    VK_CHECK(vkEndCommandBuffer(r->aux_command_buffer));
+    r->in_aux_command_buffer = false;
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit_infos[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &r->aux_command_buffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &r->partial_semaphore,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &r->command_buffer,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &r->partial_semaphore,
+            .pWaitDstStageMask = &wait_stage,
+        }
+    };
+    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
+    vkResetFences(r->device, 1, &r->partial_fence);
+    VK_CHECK(vkQueueSubmit(r->queue, ARRAY_SIZE(submit_infos), submit_infos,
+                           r->partial_fence));
+    r->partial_pending = true;
+    r->draws_since_submit = 0;
+
+    /* Go on in the other pair */
+    r->command_buffer_slot ^= 1;
+    r->command_buffer = r->command_buffers[2 * r->command_buffer_slot];
+    r->aux_command_buffer = r->command_buffers[2 * r->command_buffer_slot + 1];
+
+    VkCommandBufferBeginInfo command_buffer_begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_CHECK(vkBeginCommandBuffer(r->command_buffer,
+                                  &command_buffer_begin_info));
+}
+
 static void begin_draw(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -1617,7 +1720,11 @@ static void begin_draw(PGRAPHState *pg)
 
     bool must_bind_pipeline = r->pipeline_binding_changed;
 
+    r->draws_since_submit++;
     if (!r->in_render_pass) {
+        if (r->draws_since_submit >= PARTIAL_SUBMIT_DRAWS) {
+            submit_partial(pg);
+        }
         begin_render_pass(pg);
         must_bind_pipeline = true;
     }
