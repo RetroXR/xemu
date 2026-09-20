@@ -1157,6 +1157,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
     }
 
     const char *game_path = game ? game->path : NULL;
+    if (game_path && !*game_path) {
+        /* An empty tray, to a frontend that always passes a path */
+        game_path = NULL;
+    }
     retro_thread = g_thread_self();
 
     if (game_loaded) {
