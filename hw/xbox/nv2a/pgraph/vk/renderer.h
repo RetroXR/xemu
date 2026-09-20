@@ -313,6 +313,11 @@ typedef struct PGRAPHVkDisplayState {
     VmaAllocation readback_allocation;
     uint8_t *readback_data;
     bool readback_valid;
+
+    /* Composing is not waited for by the renderer, see render_display() */
+    VkCommandBuffer command_buffer;
+    VkFence fence;
+    bool compose_pending;
 #endif
 } PGRAPHVkDisplayState;
 
@@ -513,6 +518,7 @@ VkDeviceSize pgraph_vk_append_to_buffer(PGRAPHState *pg, int index, void **data,
                                         VkDeviceAddress alignment);
 
 // command.c
+void pgraph_vk_display_wait(PGRAPHVkState *r);
 void pgraph_vk_init_command_buffers(PGRAPHState *pg);
 void pgraph_vk_finalize_command_buffers(PGRAPHState *pg);
 VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg);

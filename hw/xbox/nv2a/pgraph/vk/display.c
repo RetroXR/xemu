@@ -545,6 +545,8 @@ static void destroy_current_display_image(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
     PGRAPHVkDisplayState *d = &r->display;
 
+    pgraph_vk_display_wait(r);
+
     if (d->image == VK_NULL_HANDLE) {
         return;
     }
@@ -948,6 +950,8 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
         pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
     }
 
+    pgraph_vk_display_wait(r);
+
     pgraph_vk_upload_surface_data(d, surface, !tcg_enabled());
 
     disp->pvideo.state = get_pvideo_state(pg);
@@ -958,7 +962,16 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
     update_uniforms(pg, surface);
     update_descriptor_set(pg, surface);
 
+#if HAVE_EXTERNAL_MEMORY
     VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+#else
+    VkCommandBuffer cmd = disp->command_buffer;
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+#endif
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_YELLOW,
         "Display Surface %08"HWADDR_PRIx, surface->vram_addr);
 
@@ -1054,15 +1067,27 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
 #endif
 
     pgraph_vk_end_debug_marker(r, cmd);
+#if HAVE_EXTERNAL_MEMORY
     pgraph_vk_end_single_time_commands(pg, cmd);
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
-
-#if !HAVE_EXTERNAL_MEMORY
-    /* The submission above is waited for, so the copy has completed */
-    vmaInvalidateAllocation(r->allocator, disp->readback_allocation, 0,
-                            VK_WHOLE_SIZE);
+#else
+    /*
+     * The renderer has no use for the result, and what is ahead in the queue
+     * may be a good part of a frame. The one who wants the pixels waits, see
+     * pgraph_vk_get_display_pixels(), and the renderer only does before it
+     * changes or lets go of what is used here.
+     */
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkResetFences(r->device, 1, &disp->fence);
+    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, disp->fence));
+    disp->compose_pending = true;
     disp->readback_valid = true;
 #endif
+    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
 
     disp->draw_time = surface->draw_time;
     disp->composed = true;
@@ -1101,8 +1126,38 @@ static void destroy_surface_sampler(PGRAPHState *pg)
     r->display.sampler = VK_NULL_HANDLE;
 }
 
+void pgraph_vk_display_wait(PGRAPHVkState *r)
+{
+#if !HAVE_EXTERNAL_MEMORY
+    PGRAPHVkDisplayState *disp = &r->display;
+
+    if (disp->compose_pending) {
+        VK_CHECK(vkWaitForFences(r->device, 1, &disp->fence, VK_TRUE,
+                                 UINT64_MAX));
+        disp->compose_pending = false;
+    }
+#endif
+}
+
 void pgraph_vk_init_display(PGRAPHState *pg)
 {
+#if !HAVE_EXTERNAL_MEMORY
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = r->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VK_CHECK(vkAllocateCommandBuffers(r->device, &alloc_info,
+                                      &r->display.command_buffer));
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    };
+    VK_CHECK(vkCreateFence(r->device, &fence_info, NULL, &r->display.fence));
+#endif
+
     create_descriptor_pool(pg);
     create_descriptor_set_layout(pg);
     create_descriptor_sets(pg);
@@ -1114,6 +1169,13 @@ void pgraph_vk_init_display(PGRAPHState *pg)
 void pgraph_vk_finalize_display(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+
+    pgraph_vk_display_wait(r);
+#if !HAVE_EXTERNAL_MEMORY
+    vkFreeCommandBuffers(r->device, r->command_pool, 1,
+                         &r->display.command_buffer);
+    vkDestroyFence(r->device, r->display.fence, NULL);
+#endif
 
     destroy_pvideo_image(pg);
 
@@ -1140,6 +1202,14 @@ const uint8_t *pgraph_vk_get_display_pixels(PGRAPHState *pg, int *width,
     if (!disp->readback_valid) {
         return NULL;
     }
+
+    /*
+     * Called while the renderer is kept from composing again, so the fence
+     * is not reset under us. It may be waiting for the same fence.
+     */
+    VK_CHECK(vkWaitForFences(r->device, 1, &disp->fence, VK_TRUE, UINT64_MAX));
+    vmaInvalidateAllocation(r->allocator, disp->readback_allocation, 0,
+                            VK_WHOLE_SIZE);
 
     *width = disp->width;
     *height = disp->height;
