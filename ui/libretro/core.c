@@ -844,6 +844,7 @@ static bool configure(const char *game_path)
     g_config.perf.cache_shaders =
         variable_is("xemu_cache_shaders", "enabled", true);
     g_config.audio.use_dsp = variable_is("xemu_use_dsp", "enabled", false);
+    g_config.audio.use_dsp_jit = variable_is("xemu_dsp_engine", "jit", true);
 
     const char *avpack = get_variable("xemu_avpack");
     static const struct {

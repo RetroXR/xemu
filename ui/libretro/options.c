@@ -202,6 +202,18 @@ static struct retro_core_option_v2_definition definitions[] = {
         "disabled",
     },
     {
+        "xemu_dsp_engine",
+        "Audio > DSP Engine",
+        "DSP Engine",
+        "How the audio DSPs are run when they are emulated. The JIT "
+        "compiles their programs for the host and is several times faster "
+        "than the interpreter.",
+        NULL,
+        "audio",
+        { { "jit", "JIT" }, { "interpreter", "Interpreter" }, { NULL, NULL } },
+        "jit",
+    },
+    {
         "xemu_hrtf",
         "Audio > 3D Audio (HRTF)",
         "3D Audio (HRTF)",

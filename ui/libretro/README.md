@@ -20,8 +20,22 @@ libslirp, libsamplerate, libpcap and SDL3 built for `aarch64-linux-android`.
 SDL is only there for its headers and platform independent helpers; none of
 it that needs a Java side is called. There is no desktop GL on Android, so
 this build has no GL at all (`--disable-opengl`): the Vulkan renderer is the
-only one, its display image is read back, and the DSP JIT (a prebuilt library)
-is replaced by the interpreter.
+only one, and its display image is read back.
+
+The DSP JIT is a Rust library that xemu downloads prebuilt, and nobody
+publishes it for Android. Without it the interpreter is used. To have it,
+build it from the source of the version that `subprojects/dsp56300/meson.build`
+names and leave the archive where a download would have gone:
+
+```bash
+rustup target add aarch64-linux-android
+git clone --branch v0.1.3 https://github.com/mborgerson/dsp56300 && cd dsp56300
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android29-clang
+export CC_aarch64_linux_android=$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+RUSTUP_TOOLCHAIN=stable cargo build --release --target aarch64-linux-android -p dsp56300-emu-ffi
+# dsp56300-0.1.3-aarch64-linux-android/{lib/libdsp56300_emu_ffi.a,include/dsp56300.h}
+# as dsp56300-0.1.3-aarch64-linux-android.tar.gz into subprojects/dsp56300/
+```
 
 Tested on a Quest 3 (Adreno 740): Halo runs at its native 30 fps. What it took
 beyond building, all in `hw/xbox/nv2a/pgraph/vk/` and harmless elsewhere:
@@ -123,7 +137,8 @@ again in the same process, so this is not a conventional core:
   White/Black, L2/R2 the triggers, Select is Back.
 - Core options (v2 with categories, v1 fallback): memory, AV pack, boot
   animation, hard FPU, hard disk location, renderer, internal resolution scale,
-  aspect ratio, output filtering, shader cache, DSP, HRTF, voice resampler
+  aspect ratio, output filtering, shader cache, DSP and its engine (JIT or
+  interpreter), HRTF, voice resampler
   (linear by default on Android, sinc elsewhere), and a memory unit
   for each of the two expansion slots of every port.
 - `xemu_libretro.info` in this directory is the matching core info file.
