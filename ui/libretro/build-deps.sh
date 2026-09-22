@@ -146,7 +146,7 @@ if ! have sdl3; then
     cmake -S . -B _build "${cmake_host[@]}" "${cmake_common[@]}" \
         -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF \
         -DSDL_CAMERA=OFF -DSDL_GPU=OFF -DSDL_RENDER=OFF -DSDL_HAPTIC=OFF \
-        -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_TRAY=OFF
+        -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_TRAY=OFF -DSDL_X11_XTEST=OFF
     ninja -C _build -j"$jobs" install
 fi
 
