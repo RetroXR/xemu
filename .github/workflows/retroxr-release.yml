@@ -200,7 +200,7 @@ jobs:
           fetch-depth: 0
 
       # Headers only, for what is resolved at run time: X11 and Wayland for
-      # SDL3 (xemu's own subproject, which dlopens them), GL and EGL for epoxy,
+      # SDL3 (built by build-deps.sh, and it dlopens them), GL and EGL for epoxy,
       # and the Vulkan headers and loader. None of the libraries xemu itself
       # needs are installed from apt, so that none can be linked by accident.
       - name: Install dependencies

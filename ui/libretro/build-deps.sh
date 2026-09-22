@@ -9,9 +9,10 @@
 # about which shared libraries are installed or what they are called: libpcap
 # is libpcap.so.0.8 on Debian and libpcap.so.1 everywhere else, and libslirp
 # comes with QEMU or not at all. On Android there is no system copy of any of
-# them. glib, pixman, libsamplerate, libslirp, libpcap and, for Linux, libepoxy
-# are therefore built from source here; what is left dynamic is the platform
-# (libc, libGL, libvulkan) and whatever SDL and epoxy dlopen at run time.
+# them. glib, pixman, libsamplerate, libslirp, libpcap, SDL3 and, for Linux,
+# libepoxy are therefore built from source here; what is left dynamic is the
+# platform (libc, libGL, libvulkan) and whatever SDL and epoxy dlopen at run
+# time.
 #
 # The prefix has no shared libraries in it, and pkg-config has to be asked for
 # --static when it is read (see pkg-config-static below): the private
@@ -135,26 +136,26 @@ if ! have libpcap; then
     rm -f "$prefix"/lib/libpcap.so*
 fi
 
-if [ "$host" = android ]; then
-    # Only its headers and platform independent helpers get used: there is
-    # no SDL video on Android
-    if ! have sdl3; then
-        fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz sdl3
-        cmake -S . -B _build "${cmake_host[@]}" "${cmake_common[@]}" \
-            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF \
-            -DSDL_CAMERA=OFF -DSDL_GPU=OFF -DSDL_RENDER=OFF -DSDL_HAPTIC=OFF \
-            -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_TRAY=OFF
-        ninja -C _build -j"$jobs" install
-    fi
-else
-    # epoxy resolves GL with dlopen, so a static copy adds no dependency. On
-    # Linux, SDL3 is left to xemu's own subproject.
-    if ! have epoxy; then
-        fetch https://github.com/anholt/libepoxy/archive/refs/tags/1.5.10.tar.gz epoxy
-        meson setup _build "${meson_host[@]}" "${meson_common[@]}" \
-            -Dtests=false -Ddocs=false -Dglx=yes -Degl=yes -Dx11=true
-        ninja -C _build -j"$jobs" install
-    fi
+# SDL3. On Android only its headers and platform independent helpers get
+# used: there is no SDL video there. On Linux it makes the hidden window the
+# OpenGL renderer draws through, and dlopens X11 or Wayland to do it. xemu's
+# own sdl3 subproject is not used for Linux because meson cannot tell that
+# CMake built it position independent, and refuses to link it into the core.
+if ! have sdl3; then
+    fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz sdl3
+    cmake -S . -B _build "${cmake_host[@]}" "${cmake_common[@]}" \
+        -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF \
+        -DSDL_CAMERA=OFF -DSDL_GPU=OFF -DSDL_RENDER=OFF -DSDL_HAPTIC=OFF \
+        -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_TRAY=OFF
+    ninja -C _build -j"$jobs" install
+fi
+
+# epoxy resolves GL with dlopen, so a static copy adds no dependency
+if [ "$host" = linux ] && ! have epoxy; then
+    fetch https://github.com/anholt/libepoxy/archive/refs/tags/1.5.10.tar.gz epoxy
+    meson setup _build "${meson_host[@]}" "${meson_common[@]}" \
+        -Dtests=false -Ddocs=false -Dglx=yes -Degl=yes -Dx11=true
+    ninja -C _build -j"$jobs" install
 fi
 
 # meson reads PKG_CONFIG as a single program, so --static goes in a wrapper
