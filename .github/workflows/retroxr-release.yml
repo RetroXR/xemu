@@ -1,0 +1,328 @@
+# Build the retroXR xemu libretro core for Windows, Android and Linux and
+# publish it as a release, so retroXR's CoreDownloadManager can fetch it.
+#
+# xemu is an original Xbox emulator and a fork of QEMU. This fork builds it as
+# a libretro core (ui/libretro/, --enable-libretro): the machine free-runs on
+# QEMU's own threads and retro_run() hands over the latest frame, so there are
+# no savestates, rewind or fast-forward. ui/libretro/README.md has the design.
+#
+#   Windows  xemu_libretro.dll.zip           containing xemu_libretro.dll
+#   Android  xemu_libretro_android.so.zip    containing xemu_libretro_android.so
+#   Linux    xemu_libretro.so.zip            containing xemu_libretro.so
+#   and      LICENSE-<platform>.txt          scripts/gen-license.py's notices
+#
+# retroxr-xemu-libretro-v1 and -v2 were built by hand, in the same containers
+# and with the same NDK these jobs use; this workflow is the first to build it.
+#
+# macOS is NOT built. The core compiles on POSIX already (Android is one), but
+# it cannot draw there: without a Vulkan loader at build time the only renderer
+# is OpenGL, and that one makes its context on a hidden SDL window created on
+# the core's own thread. Cocoa creates windows on the main thread only, and the
+# frontend's main thread is blocked in retro_load_game() waiting for that
+# thread. Drawing on macOS needs a CGL context (or MoltenVK, which lacks the
+# geometry shaders the Vulkan renderer still uses for quads and lines) --
+# porting work, not a CI job.
+#
+# The release must NOT be a prerelease: the download URL is the /releases/latest/
+# form so shipping a build needs no app update, and GitHub's `latest` skips
+# prereleases. Anything else cut on this fork should be marked prerelease.
+name: retroXR core release
+
+on:
+  push:
+    tags:
+      - 'retroxr-xemu-libretro-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build'
+        required: true
+        default: 'retroxr'
+      tag:
+        description: 'Release tag to publish as (leave blank to build without publishing)'
+        required: false
+        default: ''
+
+jobs:
+  # Cross-compiled in upstream xemu's own Windows toolchain image (MXE, static
+  # gcc), the one its build-windows.yml uses for x86_64. --static links every
+  # dependency into the DLL.
+  windows:
+    name: Windows x86_64 (MXE)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/xemu-project/xemu-win64-toolchain-gcc:sha-2881edd
+    defaults:
+      run:
+        shell: bash
+    env:
+      CROSSPREFIX: x86_64-w64-mingw32.static-
+      CROSSAR: x86_64-w64-mingw32.static-gcc-ar
+    steps:
+      # git before checkout, or the action falls back to a tarball with no
+      # history: the version comes from `git describe --match 'v*'` over
+      # upstream's tags, and the meson wraps are git clones.
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -qy git curl zstd zip
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git describe --tags --match 'v*'
+          ./build.sh -p win64-cross --libretro
+
+      # The build carries its DWARF (about 170 MB); the deliverable is stripped.
+      - name: Package
+        run: |
+          mapfile -t hits < <(find dist -maxdepth 1 -name 'xemu_libretro.dll' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one xemu_libretro.dll, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage out
+          ${CROSSPREFIX}strip -o stage/xemu_libretro.dll "${hits[0]}"
+          (cd stage && zip -q -X ../out/xemu_libretro.dll.zip xemu_libretro.dll)
+          cp dist/LICENSE.txt out/LICENSE-windows.txt
+          ls -lh stage out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+
+  android:
+    name: Android arm64-v8a
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: 29
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # The NDK goes into RUNNER_TEMP, not the workspace: checkout clears the
+      # workspace, and the NDK is reused by the dependency and JIT builds.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qy python3-venv ninja-build pkg-config bison flex \
+            unzip git curl build-essential cmake gettext zstd zip
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install meson==1.8.2 ninja packaging
+          echo "$RUNNER_TEMP/venv/bin" >> $GITHUB_PATH
+          curl -fsSL -o "$RUNNER_TEMP/ndk.zip" https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_ROOT=$RUNNER_TEMP/android-ndk-r27d" >> $GITHUB_ENV
+
+      # glib, pixman, libsamplerate, libslirp, libpcap and SDL3's headers,
+      # static and position independent. Keyed on the script that builds them.
+      - uses: actions/cache@v4
+        id: deps
+        with:
+          path: ${{ runner.temp }}/deps-android
+          key: xemu-deps-android-${{ hashFiles('ui/libretro/build-deps.sh') }}
+
+      - name: Build dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: DEPS_WORK="$RUNNER_TEMP/deps-android.build" ui/libretro/build-deps.sh android "$RUNNER_TEMP/deps-android"
+
+      # The DSP JIT is a Rust library xemu downloads prebuilt, and no Android
+      # build of it is published: without this the core silently falls back to
+      # the DSP interpreter. The archive is laid out as a release would be and
+      # left where subprojects/dsp56300/meson.build looks for one.
+      - name: Build the DSP JIT
+        run: |
+          ver=$(sed -n "s/^project('dsp56300', version: '\(.*\)')/\1/p" subprojects/dsp56300/meson.build)
+          test -n "$ver"
+          rustup target add aarch64-linux-android
+          git clone -q --depth 1 --branch "v$ver" https://github.com/mborgerson/dsp56300.git "$RUNNER_TEMP/dsp56300"
+          tc="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android${ANDROID_API}-clang"
+          export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+          export AR_aarch64_linux_android="$tc/llvm-ar"
+          (cd "$RUNNER_TEMP/dsp56300" && cargo build --release --target aarch64-linux-android -p dsp56300-emu-ffi)
+          out="$RUNNER_TEMP/dsp/dsp56300-$ver-aarch64-linux-android"
+          mkdir -p "$out/lib" "$out/include"
+          cp "$RUNNER_TEMP/dsp56300/target/aarch64-linux-android/release/libdsp56300_emu_ffi.a" "$out/lib/"
+          cp "$RUNNER_TEMP"/dsp56300/crates/emu-ffi/include/*.h "$out/include/"
+          cp "$RUNNER_TEMP/dsp56300/LICENSE" "$out/"
+          tar czf "subprojects/dsp56300/dsp56300-$ver-aarch64-linux-android.tar.gz" -C "$RUNNER_TEMP/dsp" "$(basename "$out")"
+
+      - name: Build
+        run: ANDROID_DEPS="$RUNNER_TEMP/deps-android" ./build.sh -p android
+
+      - name: Package
+        run: |
+          mapfile -t hits < <(find dist -maxdepth 1 -name 'xemu_libretro_android.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one xemu_libretro_android.so, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage out
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            -o stage/xemu_libretro_android.so "${hits[0]}"
+          (cd stage && zip -q -X ../out/xemu_libretro_android.so.zip xemu_libretro_android.so)
+          cp dist/LICENSE.txt out/LICENSE-android.txt
+          file stage/xemu_libretro_android.so
+          ls -lh stage out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*
+          if-no-files-found: error
+
+  # The oldest Ubuntu runner: a shared library loads only against a glibc at
+  # least as new as the one it was linked with.
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # Headers only, for what is resolved at run time: X11 and Wayland for
+      # SDL3 (xemu's own subproject, which dlopens them), GL and EGL for epoxy,
+      # and the Vulkan headers and loader. None of the libraries xemu itself
+      # needs are installed from apt, so that none can be linked by accident.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qy python3-venv ninja-build pkg-config bison flex \
+            git curl build-essential cmake zip \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libgl-dev libegl-dev libvulkan-dev
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install meson==1.8.2 ninja packaging
+          echo "$RUNNER_TEMP/venv/bin" >> $GITHUB_PATH
+
+      - uses: actions/cache@v4
+        id: deps
+        with:
+          path: ${{ runner.temp }}/deps-linux
+          key: xemu-deps-linux-${{ hashFiles('ui/libretro/build-deps.sh') }}
+
+      - name: Build dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: DEPS_WORK="$RUNNER_TEMP/deps-linux.build" ui/libretro/build-deps.sh linux "$RUNNER_TEMP/deps-linux"
+
+      # The prefix is searched before the system's .pc files, which remain
+      # visible for the header-only packages above (vulkan, x11, gl).
+      - name: Build
+        run: |
+          export PKG_CONFIG="$RUNNER_TEMP/deps-linux/pkg-config-static"
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/deps-linux/lib/pkgconfig"
+          ./build.sh --libretro \
+            --disable-gtk --disable-tools --disable-guest-agent --disable-docs \
+            --disable-libusb --disable-curl --disable-vnc --disable-plugins
+
+      # A shared module links with undefined symbols and fails only when it is
+      # loaded, so it is loaded here, with every symbol bound (RTLD_NOW). The
+      # libraries that were built static must not turn up as DT_NEEDED.
+      - name: Package
+        run: |
+          mapfile -t hits < <(find dist -maxdepth 1 -name 'xemu_libretro.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one xemu_libretro.so, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage out
+          strip -o stage/xemu_libretro.so "${hits[0]}"
+          readelf -d stage/xemu_libretro.so | grep NEEDED
+          if readelf -d stage/xemu_libretro.so | grep NEEDED | grep -E 'glib|gio|gobject|pixman|samplerate|slirp|pcap|epoxy|SDL|pcre|ffi'; then
+            echo "xemu_libretro.so links a library that should be inside it"
+            exit 1
+          fi
+          python3 -c "import ctypes, os; l = ctypes.CDLL(os.path.abspath('stage/xemu_libretro.so'), mode=os.RTLD_NOW); print('retro_api_version', l.retro_api_version())"
+          (cd stage && zip -q -X ../out/xemu_libretro.so.zip xemu_libretro.so)
+          cp dist/LICENSE.txt out/LICENSE-linux.txt
+          file stage/xemu_libretro.so
+          ls -lh stage out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, android, linux]
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          cat > notes.md <<EOF
+          xemu libretro core built for retroXR, from \`$GITHUB_SHA\`.
+
+          Windows x86_64, Android arm64-v8a and Linux x86_64. The source for
+          these binaries is this tag, which is how the GPLv2 obligation is met;
+          \`LICENSE-*.txt\` carry the notices of what is linked in. Each zip
+          holds the bare library at its root. There is no macOS build: the
+          core's OpenGL context comes from an SDL window made off the main
+          thread, which Cocoa does not allow.
+
+          The Linux core carries glib, pixman, libsamplerate, libslirp, libpcap,
+          libepoxy and SDL3 inside it, so it needs nothing beyond libc, libGL
+          and a Vulkan loader. These are the first builds of this core made by
+          CI rather than by hand.
+
+          xemu is an original Xbox emulator and a fork of QEMU. It is not a
+          conventional core: the machine free-runs on QEMU's own threads and is
+          created once per process, and \`retro_run()\` hands over the latest
+          frame and one video frame of audio. No save states, rewind or
+          fast-forward. \`ui/libretro/README.md\` has the design, the options
+          and the debugging switches.
+
+          What it needs: \`mcpx_1.0.bin\`, a BIOS (either Complex 4627 dump is
+          known to boot), \`xbox_hdd.qcow2\` and optionally \`xbox_eeprom.bin\`
+          in \`<system>/xemu/\`. The hard disk and EEPROM are copied to
+          \`<save>/xemu/\` on first use and live there.
+
+          What is in it: OpenGL and Vulkan renderers (Vulkan only on Android,
+          with the fixes a Quest 3's Adreno 740 needed); four controller ports
+          with rumble and two hot-pluggable memory units each; several copies of
+          the core file in one process sharing one machine; and performance
+          work for ARM hosts, including the DSP JIT on Android.
+          EOF
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "xemu (retroXR build) $TAG" \
+              --notes-file notes.md
+          fi
+          gh release upload "$TAG" \
+            dist/xemu_libretro.dll.zip \
+            dist/xemu_libretro_android.so.zip \
+            dist/xemu_libretro.so.zip \
+            dist/LICENSE-windows.txt \
+            dist/LICENSE-android.txt \
+            dist/LICENSE-linux.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
