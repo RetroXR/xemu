@@ -139,8 +139,13 @@ jobs:
       # The DSP JIT is a Rust library xemu downloads prebuilt, and no Android
       # build of it is published: without this the core silently falls back to
       # the DSP interpreter. The archive is laid out as a release would be and
-      # left where subprojects/dsp56300/meson.build looks for one.
+      # left where subprojects/dsp56300/meson.build looks for one. The repo
+      # pins its own toolchain (rust-toolchain.toml), which rustup would install
+      # without the Android target; RUSTUP_TOOLCHAIN=stable overrides the pin,
+      # as the hand-built v1 and v2 did.
       - name: Build the DSP JIT
+        env:
+          RUSTUP_TOOLCHAIN: stable
         run: |
           ver=$(sed -n "s/^project('dsp56300', version: '\(.*\)')/\1/p" subprojects/dsp56300/meson.build)
           test -n "$ver"
@@ -220,7 +225,8 @@ jobs:
         if: steps.deps.outputs.cache-hit != 'true'
         run: DEPS_WORK="$RUNNER_TEMP/deps-linux.build" ui/libretro/build-deps.sh linux "$RUNNER_TEMP/deps-linux"
 
-      # The prefix is searched before the system's .pc files, which remain
+      # b_staticpic, as for Android: QEMU's internal static libraries are
+      # linked into a shared module. The prefix is searched before the system's .pc files, which remain
       # visible for the header-only packages above (vulkan, x11, gl).
       - name: Build
         run: |
@@ -228,7 +234,7 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/deps-linux/lib/pkgconfig"
           ./build.sh --libretro \
             --disable-gtk --disable-tools --disable-guest-agent --disable-docs \
-            --disable-libusb --disable-curl --disable-vnc --disable-plugins
+            --disable-libusb --disable-curl --disable-vnc --disable-plugins             -Db_staticpic=true
 
       # A shared module links with undefined symbols and fails only when it is
       # loaded, so it is loaded here, with every symbol bound (RTLD_NOW). The
